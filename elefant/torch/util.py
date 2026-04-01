@@ -10,6 +10,43 @@ import torch.nn as nn
 ELEFANT_WANDB_DIR = "/tmp/elefant_wandb"
 
 
+def _get_global_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+
+    for env_var in ("RANK", "SLURM_PROCID", "LOCAL_RANK"):
+        value = os.environ.get(env_var)
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                continue
+    return 0
+
+
+class _MainProcessLoggingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return _get_global_rank() == 0 or record.levelno >= logging.ERROR
+
+
+def configure_logging(level: int = logging.INFO):
+    logging.basicConfig(level=level, force=True)
+    root_logger = logging.getLogger()
+
+    for handler in root_logger.handlers:
+        if not getattr(handler, "_elefant_main_process_filter", False):
+            handler.addFilter(_MainProcessLoggingFilter())
+            handler._elefant_main_process_filter = True
+
+    # torch.compile(mode="max-autotune") can emit very noisy benchmarking logs.
+    for logger_name in (
+        "torch._inductor.select_algorithm",
+        "torch._inductor.autotune_process",
+        "torch._inductor.runtime.triton_heuristics",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
 def pytorch_setup(set_seed: bool = False):
     if set_seed:
         torch.manual_seed(0)

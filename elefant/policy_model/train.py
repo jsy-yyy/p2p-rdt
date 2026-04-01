@@ -5,15 +5,22 @@ from elefant.policy_model.stage3_finetune import train_stage3_finetune
 import logging
 import torch
 import elefant.torch
+from elefant.torch import configure_logging
 
 
 def lightning_main():
-    logging.basicConfig(level=logging.INFO, force=True)
+    configure_logging(level=logging.INFO)
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--fast_dev_run", action="store_true")
     parser.add_argument("--no_compile", action="store_true")
     parser.add_argument("--data_folder", type=str, default=None)
+    parser.add_argument(
+        "--resume_from_ckpt",
+        type=str,
+        default=None,
+        help="Checkpoint file or directory to resume stage3 training from.",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config, LightningPolicyConfig)
@@ -22,8 +29,14 @@ def lightning_main():
     if args.data_folder is not None:
         logging.info(f"Using local data folder: {args.data_folder}")
         config.stage3_finetune.training_dataset.local_prefix = args.data_folder
+        config.stage3_finetune.training_dataset.dataset_path = args.data_folder
         for val_dataset in config.stage3_finetune.validation_datasets:
             val_dataset.local_prefix = args.data_folder
+            val_dataset.dataset_path = args.data_folder
+
+    if args.resume_from_ckpt is not None:
+        logging.info(f"Using resume checkpoint: {args.resume_from_ckpt}")
+        config.stage3_finetune.init.stage3_model_path = args.resume_from_ckpt
 
     if args.fast_dev_run:
         logging.warning("!!!Fast dev run is enabled!!!")

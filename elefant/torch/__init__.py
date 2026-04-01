@@ -1,5 +1,6 @@
 from elefant.torch.util import (
     pytorch_setup,
+    configure_logging,
     eager_assert,
     cross_entropy_to_perplexity,
     cross_entropy_to_bits_per_dim,
@@ -10,6 +11,7 @@ from elefant.torch.util import (
 
 __all__ = [
     "pytorch_setup",
+    "configure_logging",
     "eager_assert",
     "cross_entropy_to_perplexity",
     "cross_entropy_to_bits_per_dim",

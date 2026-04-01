@@ -1,4 +1,5 @@
 import logging
+import json
 
 import lightning as pl
 import torch
@@ -8,6 +9,7 @@ import fsspec
 from torch import nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import DataLoader
 from elefant.data import (
     ActionLabelVideoProtoDataset,
     ActionLabelVideoProtoDatasetConfig,
@@ -18,6 +20,10 @@ from elefant.data import (
 )
 from elefant.text_tokenizer.config import TextTokenizerConfig
 from elefant.data.rand_augment import BatchRandAugment
+from elefant.data.lerobot_latent_dataset import (
+    MultiLatentLeRobotDataset,
+    infer_text_embedding_shape_from_dataset,
+)
 from elefant.policy_model.config import LightningPolicyConfig
 from elefant.policy_model.model_free import ModelFreePolicy
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -36,7 +42,73 @@ from elefant.torch import count_model_parameters
 from elefant.data.action_mapping import UniversalAutoregressiveActionMapping
 from elefant.metrics import LossMetric
 from elefant.policy_model.config import DatasetConfig, ValidationDatasetConfig
+from rdt.model import RDT
 from lightning.fabric.utilities.cloud_io import get_filesystem
+
+
+def _metric_to_float(metric_value: torch.Tensor | float) -> float:
+    if isinstance(metric_value, torch.Tensor):
+        return float(metric_value.detach().float().cpu().item())
+    return float(metric_value)
+
+
+def _validate_resume_checkpoint_compatibility(
+    checkpoint_path: str, config: LightningPolicyConfig
+) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    state_dict = checkpoint.get('state_dict', {})
+    if not state_dict:
+        logging.warning('Checkpoint %s has no state_dict; skipping action-dimension compatibility check.', checkpoint_path)
+        return
+
+    expected_n_actions = config.stage3_finetune.training_dataset.get_robot_action_dim()
+    action_pos_tokens = state_dict.get('bc_transformer.action_pos_tokens')
+    if action_pos_tokens is not None:
+        checkpoint_n_actions = int(action_pos_tokens.shape[1])
+        if checkpoint_n_actions != expected_n_actions:
+            raise ValueError(
+                'Resume checkpoint action dimension mismatch: '
+                f'checkpoint has {checkpoint_n_actions} action tokens but config expects {expected_n_actions}. '
+                'This usually means you are trying to resume a checkpoint trained with a different robot_action_dim.'
+            )
+
+    x_pos_emb = state_dict.get('rdt_policy_head.x_pos_emb')
+    if x_pos_emb is not None:
+        expected_x_pos_tokens = expected_n_actions + config.policy_model.rdt.num_register_tokens
+        checkpoint_x_pos_tokens = int(x_pos_emb.shape[1])
+        if checkpoint_x_pos_tokens != expected_x_pos_tokens:
+            raise ValueError(
+                'Resume checkpoint RDT position embedding mismatch: '
+                f'checkpoint has {checkpoint_x_pos_tokens} x_pos tokens but config expects {expected_x_pos_tokens}. '
+                'This usually means you are trying to resume a checkpoint trained with a different robot_action_dim.'
+            )
+
+
+def _resolve_resume_checkpoint_path(config: LightningPolicyConfig) -> Optional[str]:
+    checkpoint_path = config.stage3_finetune.init.stage3_model_path
+    if not checkpoint_path:
+        return None
+
+    filesystem = get_filesystem(checkpoint_path)
+    if filesystem.exists(checkpoint_path) and not filesystem.isdir(checkpoint_path):
+        return checkpoint_path
+
+    if filesystem.isdir(checkpoint_path):
+        checkpoint_candidates = []
+        for entry in filesystem.ls(checkpoint_path, detail=True):
+            candidate = entry["name"] if isinstance(entry, dict) else entry
+            candidate = str(candidate)
+            if candidate.endswith(".ckpt"):
+                checkpoint_candidates.append(candidate)
+
+        if not checkpoint_candidates:
+            raise FileNotFoundError(
+                f"No .ckpt files found in checkpoint directory: {checkpoint_path}"
+            )
+
+        return sorted(checkpoint_candidates)[-1]
+
+    raise FileNotFoundError(f"Checkpoint path does not exist: {checkpoint_path}")
 
 
 def upload_model_config(checkpoint_path: str, config):
@@ -47,13 +119,14 @@ def upload_model_config(checkpoint_path: str, config):
         f.write(pydantic_yaml.to_yaml_str(config).encode())
 
 
-def upload_action_mapping(
-    checkpoint_path: str, action_mapping: UniversalAutoregressiveActionMapping
-):
-    """Upload the action mapping to the checkpoint path."""
+def upload_action_mapping(checkpoint_path: str, action_mapping):
+    """Upload the action specification to the checkpoint path."""
     logging.info(f"Uploading action mapping to {checkpoint_path}/action_mapping.json")
     with fsspec.open(checkpoint_path + "/action_mapping.json", "w") as f:
-        f.write(action_mapping.serialize())
+        if hasattr(action_mapping, "serialize"):
+            f.write(action_mapping.serialize())
+        else:
+            json.dump(action_mapping, f)
 
 
 def _sample_from_distribution(
@@ -65,6 +138,57 @@ def _sample_from_distribution(
     cdf = torch.cumsum(probs, dim=-1)
     cmp = cdf >= unif_rand.unsqueeze(-1)
     return cmp.float().argmax(dim=-1)
+
+
+def _sync_text_embedding_shape_with_dataset(config: LightningPolicyConfig):
+    inferred = infer_text_embedding_shape_from_dataset(
+        config.stage3_finetune.training_dataset
+    )
+    if inferred is None:
+        return
+
+    inferred_shape, sample_path = inferred
+    current_shape = list(config.shared.text_tokenizer_config.text_embedding_shape)
+    if current_shape != inferred_shape:
+        logging.warning(
+            'Overriding text_embedding_shape from %s to %s based on %s.',
+            current_shape,
+            inferred_shape,
+            sample_path,
+        )
+    else:
+        logging.info(
+            'Using text_embedding_shape %s inferred from %s.',
+            inferred_shape,
+            sample_path,
+        )
+
+    config.shared.text_tokenizer_config.text_embedding_shape = inferred_shape
+    config.stage3_finetune.training_dataset.text_embedding_shape = inferred_shape
+    for val_dataset in config.stage3_finetune.validation_datasets:
+        val_dataset.text_embedding_shape = inferred_shape
+
+
+def _sync_sequence_length_with_dataset(config: LightningPolicyConfig):
+    target_seq_len = config.shared.n_seq_timesteps
+    training_dataset = config.stage3_finetune.training_dataset
+    if training_dataset.n_seq_timesteps != target_seq_len:
+        logging.warning(
+            'Overriding training dataset n_seq_timesteps from %s to %s to match shared.n_seq_timesteps.',
+            training_dataset.n_seq_timesteps,
+            target_seq_len,
+        )
+        training_dataset.n_seq_timesteps = target_seq_len
+
+    for val_dataset in config.stage3_finetune.validation_datasets:
+        if val_dataset.n_seq_timesteps != target_seq_len:
+            logging.warning(
+                'Overriding validation dataset `%s` n_seq_timesteps from %s to %s to match shared.n_seq_timesteps.',
+                val_dataset.validation_name,
+                val_dataset.n_seq_timesteps,
+                target_seq_len,
+            )
+            val_dataset.n_seq_timesteps = target_seq_len
 
 
 class PolicyModelTrainer(ModelFreePolicy):
@@ -79,7 +203,6 @@ class PolicyModelTrainer(ModelFreePolicy):
         )
 
         self._init_action_mapping()
-        self.n_actions = self.action_mapping.get_seq_len()
         self._already_frozen = False
         self._already_unfrozen = False
         self.generate_dummy_text_embed = False
@@ -126,7 +249,6 @@ class PolicyModelTrainer(ModelFreePolicy):
             self.rand_augment = None
             self.augment_fraction = 0.0
 
-    # TODO: probably can merge with _action_sampler
     def _keyboard_mouse_action_sampler(
         self,
         action_token: torch.Tensor,
@@ -135,197 +257,105 @@ class PolicyModelTrainer(ModelFreePolicy):
         sampling_temperature: float = 1.0,
         unif_rand: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        T = action_token.shape[0]
-        eager_assert(
-            action_token.shape,
-            (T, 1, self.config.policy_model.action_decoder.embed_dim),
+        raise RuntimeError(
+            "The keyboard/mouse autoregressive sampler is not available in the LeRobot + RDT path. Use online_full_predict() with continuous RobotAction inputs instead."
         )
-        # Sample from the action token and return the sampled action and the action_embedding for the auto-regressive step.
-        if action_idx < self.n_keyboard_actions:
-            action_logits = self.keyboard_out_logits(action_token)
-            eager_assert(action_logits.shape, (T, 1, self.n_keyboard_choices))
-        elif action_idx < self.n_keyboard_actions + self.n_mouse_button_actions:
-            action_logits = self.mouse_button_out_logits(action_token)
-            eager_assert(action_logits.shape, (T, 1, self.n_mouse_button_choices))
-        elif action_idx < self.n_keyboard_actions + self.n_mouse_button_actions + 1:
-            action_logits = self.mouse_delta_x_out_logits(action_token)
-            eager_assert(action_logits.shape, (T, 1, self.n_mouse_x_bins))
-        else:
-            eager_assert(
-                action_idx,
-                self.n_keyboard_actions + self.n_mouse_button_actions + 1,
-            )
-            action_logits = self.mouse_delta_y_out_logits(action_token)
-            eager_assert(action_logits.shape, (T, 1, self.n_mouse_y_bins))
-
-        # fast gpu sampling
-        action = _sample_from_logits_gpu(
-            action_logits,
-            sampling_temperature,
-            None if unif_rand is None else unif_rand[action_idx],
-            top_p=self.top_p,
-        ).squeeze(1)
-
-        eager_assert(action.shape, (T, 1))
-
-        # Now embed the action for the auto-regressive step and record the sample action.
-        if action_idx < self.n_keyboard_actions:
-            sampled_actions.keys[:, action_idx] = action.squeeze(1)
-            last_action_in_token = self.key_action_embedding(action)
-        elif action_idx < self.n_keyboard_actions + self.n_mouse_button_actions:
-            sampled_actions.mouse_buttons[:, action_idx - self.n_keyboard_actions] = (
-                action.squeeze(1)
-            )
-            last_action_in_token = self.mouse_button_embedding(action)
-        elif action_idx < self.n_keyboard_actions + self.n_mouse_button_actions + 1:
-            sampled_actions.mouse_delta_x[
-                :, action_idx - self.n_keyboard_actions - self.n_mouse_button_actions
-            ] = action.squeeze(1)
-            last_action_in_token = self.mouse_delta_x_embedding(action)
-        else:
-            eager_assert(
-                action_idx,
-                self.n_keyboard_actions + self.n_mouse_button_actions + 1,
-            )
-            sampled_actions.mouse_delta_y[
-                :,
-                action_idx - self.n_keyboard_actions - self.n_mouse_button_actions - 1,
-            ] = action.squeeze(1)
-            last_action_in_token = self.mouse_delta_y_embedding(action)
-
-        eager_assert(
-            last_action_in_token.shape,
-            (T, 1, self.config.policy_model.action_decoder.embed_dim),
-        )
-
-        return last_action_in_token
 
     def on_validation_epoch_start(self):
-        # done this way since val_dataloaders are not initialized in _init_ so can't get
-        # keys from it(i.e. val_set_names)
         if not self._validation_metrics and self.trainer.val_dataloaders:
             val_set_names = list(self.trainer.val_dataloaders.keys())
-            action_types = list(StructuredAction._fields)
-
             for val_set_name in val_set_names:
                 metrics = {
-                    "perplexity": LossMetric().to(self.device),
+                    "loss": LossMetric().to(self.device),
+                    "robot_action_mse": LossMetric().to(self.device),
+                    "lb_loss": LossMetric().to(self.device),
+                    "rz_loss": LossMetric().to(self.device),
                 }
-                for action_type in action_types:
-                    metric_name = self.action_type_to_metric_name[action_type]
-                    metrics[f"perplexity_{metric_name}"] = LossMetric().to(self.device)
-                metrics[f"perplexity_lb_loss"] = LossMetric().to(self.device)
-                metrics[f"perplexity_rz_loss"] = LossMetric().to(self.device)
                 for i in range(self.num_of_experts):
                     metrics[f"expert_{i}_capacity"] = LossMetric().to(self.device)
-
                 self._validation_metrics[val_set_name] = metrics
 
     def _init_metrics(self):
-        action_types = list(StructuredAction._fields)
-        self.action_type_to_metric_name = {}
-        # mapping from field names to metric names
-        for field_name in action_types:
-            if field_name == "keys":
-                self.action_type_to_metric_name[field_name] = "key"
-            elif field_name == "mouse_buttons":
-                self.action_type_to_metric_name[field_name] = "mouse_button"
-            else:
-                # for mouse_delta_x and mouse_delta_y, keep the same name
-                self.action_type_to_metric_name[field_name] = field_name
-
         self._training_loss_metric = LossMetric()
         self._training_ratio_unlabeled_metric = LossMetric()
-        self._training_cross_entropy_metric = LossMetric()
-        self._training_perplexity_metric = LossMetric()
-
-        for action_type in action_types:
-            metric_name = self.action_type_to_metric_name[action_type]
-            setattr(self, f"_training_perplexity_{metric_name}_metric", LossMetric())
-
-        setattr(self, f"_training_perplexity_lb_loss_metric", LossMetric())
-        setattr(self, f"_training_perplexity_rz_loss_metric", LossMetric())
+        self._training_robot_action_mse_metric = LossMetric()
+        self._training_lb_loss_metric = LossMetric()
+        self._training_rz_loss_metric = LossMetric()
 
         for i in range(self.num_of_experts):
             setattr(self, f"_training_expert_{i}_capacity_metric", LossMetric())
 
-        # Initialize empty dict for validation metrics
         self._validation_metrics = {}
 
     def _init_action_mapping(self):
-        # Create the mapping from actions to input tokens and from output tokens to actions.
-        self.n_actions = self.action_mapping.get_seq_len()
-
+        self.n_actions = self.config.stage3_finetune.training_dataset.get_robot_action_dim()
         self.embedding_std = 0.1
+        action_embed_dim = self.config.policy_model.action_decoder.embed_dim
+        self.rdt_hidden_size = self.config.policy_model.rdt.hidden_size
 
-        # Keyboard actions
-        self.n_keyboard_actions = self.action_mapping.get_number_of_keyboard_actions()
-        self.n_keyboard_choices = self.action_mapping.get_number_of_keyboard_choices()
-        self.key_action_embedding = nn.Embedding(
-            num_embeddings=self.n_keyboard_choices,
-            embedding_dim=self.config.policy_model.action_decoder.embed_dim,
+        def _init_linear(layer: nn.Linear):
+            torch.nn.init.normal_(layer.weight, mean=0.0, std=self.embedding_std)
+            if layer.bias is not None:
+                torch.nn.init.zeros_(layer.bias)
+
+        self.robot_action_in_proj = nn.Linear(
+            1,
+            action_embed_dim,
             dtype=torch.bfloat16,
         )
-        torch.nn.init.normal_(
-            self.key_action_embedding.weight, mean=0.0, std=self.embedding_std
-        )
+        _init_linear(self.robot_action_in_proj)
 
-        self.keyboard_out_logits = nn.Linear(
-            self.config.policy_model.action_decoder.embed_dim,
-            self.action_mapping.get_number_of_keyboard_choices(),
-        )
+        if action_embed_dim == self.rdt_hidden_size:
+            self.policy_action_to_rdt_proj = nn.Identity()
+        else:
+            self.policy_action_to_rdt_proj = nn.Linear(
+                action_embed_dim,
+                self.rdt_hidden_size,
+                dtype=torch.bfloat16,
+            )
+            _init_linear(self.policy_action_to_rdt_proj)
 
-        # Mouse buttons
-        self.n_mouse_button_actions = (
-            self.action_mapping.get_number_of_mouse_button_actions()
-        )
-        self.n_mouse_button_choices = (
-            self.action_mapping.get_number_of_mouse_button_choices()
-        )
-        self.mouse_button_embedding = nn.Embedding(
-            num_embeddings=self.n_mouse_button_choices,
-            embedding_dim=self.config.policy_model.action_decoder.embed_dim,
+        self.policy_summary_to_rdt_state_proj = nn.Linear(
+            self.config.policy_model.transformer_dim,
+            self.rdt_hidden_size,
             dtype=torch.bfloat16,
         )
-        torch.nn.init.normal_(
-            self.mouse_button_embedding.weight, mean=0.0, std=self.embedding_std
-        )
+        _init_linear(self.policy_summary_to_rdt_state_proj)
 
-        self.mouse_button_out_logits = nn.Linear(
-            self.config.policy_model.action_decoder.embed_dim,
-            self.n_mouse_button_choices,
-        )
-
-        # Mouse delta x
-        self.n_mouse_x_bins = self.action_mapping.get_n_mouse_x_bins()
-        self.mouse_delta_x_embedding = nn.Embedding(
-            num_embeddings=self.n_mouse_x_bins,
-            embedding_dim=self.config.policy_model.action_decoder.embed_dim,
+        self.text_condition_to_rdt_proj = nn.Linear(
+            self._get_text_embedding_dim(),
+            self.rdt_hidden_size,
             dtype=torch.bfloat16,
         )
-        torch.nn.init.normal_(
-            self.mouse_delta_x_embedding.weight, mean=0.0, std=self.embedding_std
-        )
+        _init_linear(self.text_condition_to_rdt_proj)
 
-        self.mouse_delta_x_out_logits = nn.Linear(
-            self.config.policy_model.action_decoder.embed_dim,
-            self.n_mouse_x_bins,
-        )
-
-        # Mouse delta y
-        self.n_mouse_y_bins = self.action_mapping.get_n_mouse_y_bins()
-        self.mouse_delta_y_embedding = nn.Embedding(
-            num_embeddings=self.n_mouse_y_bins,
-            embedding_dim=self.config.policy_model.action_decoder.embed_dim,
+        rdt_config = self.config.policy_model.rdt
+        self.rdt_policy_head = RDT(
+            horizon=self.n_actions,
+            output_size=1,
+            config={
+                "hidden_size": self.rdt_hidden_size,
+                "num_heads": rdt_config.num_heads,
+                "num_kv_heads": rdt_config.num_kv_heads,
+                "depth": rdt_config.depth,
+                "norm_eps": rdt_config.norm_eps,
+                "multiple_of": rdt_config.multiple_of,
+                "ffn_dim_multiplier": rdt_config.ffn_dim_multiplier,
+                "use_flash_attn": rdt_config.use_flash_attn,
+                "num_register_tokens": rdt_config.num_register_tokens,
+                "action_dim": 1,
+            },
+            x_pos_emb_config=[
+                ("action", self.n_actions),
+                ("register", rdt_config.num_register_tokens),
+            ],
+            lang_pos_emb_config=[],
+            max_lang_len=0,
+            img_pos_emb_config=None,
+            max_img_len=0,
+            act_pos_emb_config=[("text", self.text_token_size)],
+            max_act_len=self.text_token_size,
             dtype=torch.bfloat16,
-        )
-        torch.nn.init.normal_(
-            self.mouse_delta_y_embedding.weight, mean=0.0, std=self.embedding_std
-        )
-
-        self.mouse_delta_y_out_logits = nn.Linear(
-            self.config.policy_model.action_decoder.embed_dim,
-            self.n_mouse_y_bins,
         )
 
     def configure_model(self):
@@ -341,52 +371,57 @@ class PolicyModelTrainer(ModelFreePolicy):
         sampling_temperature: float = 1.0,
         text_tokens_embed: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, List[KVCacheState]]:
-        def _action_sampler(
-            action_token: torch.Tensor,
-            action_idx: int,
-            sampled_actions: StructuredAction,
-        ) -> torch.Tensor:
-            return self._keyboard_mouse_action_sampler(
-                action_token,
-                action_idx,
-                sampled_actions,
-                sampling_temperature,
-                unif_rand,
+        raise NotImplementedError(
+            "KV-cache autoregressive inference still depends on the old discrete action decoder and is not supported in the LeRobot + RDT path. Use online_full_predict() for continuous RobotAction prediction."
+        )
+
+    def _prepare_text_tokens_embed_for_inference(
+        self,
+        batch_size: int,
+        n_steps: int,
+        device: torch.device,
+        text_tokens_embed: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        text_dim = self._get_text_embedding_dim()
+        if text_tokens_embed is None:
+            return torch.zeros(
+                batch_size,
+                n_steps,
+                self.text_token_size,
+                text_dim,
+                device=device,
+                dtype=torch.float32,
             )
 
-        @(torch.compile(fullgraph=True) if compile else lambda f: f)
-        def _predict(frame, idx, kv_cache_state, unif_rand, text_tokens_embed):
-            frame = self._normalize_frames(frame)
-            frame = torch.unsqueeze(frame, 0).unsqueeze(0)
-
-            cache_is_full = False
-            if (
-                kv_cache_state[0].k_cache.shape[2]
-                >= self.bc_transformer.kv_cache.max_seq_len
-            ):
-                cache_is_full = True
-
-            sampled_action, idx, kv_cache_state = self.bc_transformer.online_forward(
-                frame,
-                text_tokens_embed=text_tokens_embed,
-                idx=idx,
-                kv_cache_state=kv_cache_state,
-                should_grow_cache=not cache_is_full,
-                action_sampler=_action_sampler,
-                empty_sampled_action_fn=self.action_mapping.make_empty_action,
-                reshape_structured_action_fn=None,
-                action_in_to_tokens_fn=self.action_in_to_tokens,
+        text_tokens_embed = torch.as_tensor(text_tokens_embed, device=device)
+        if text_tokens_embed.ndim == 2:
+            text_tokens_embed = text_tokens_embed.unsqueeze(0).unsqueeze(0)
+        elif text_tokens_embed.ndim == 3:
+            if text_tokens_embed.shape[0] == n_steps:
+                text_tokens_embed = text_tokens_embed.unsqueeze(0)
+            elif text_tokens_embed.shape[0] == batch_size:
+                text_tokens_embed = text_tokens_embed.unsqueeze(1)
+            else:
+                raise ValueError(
+                    f"Unsupported 3D text embedding shape {tuple(text_tokens_embed.shape)} for batch_size={batch_size}, n_steps={n_steps}."
+                )
+        elif text_tokens_embed.ndim != 4:
+            raise ValueError(
+                f"Expected text embeddings with 2, 3, or 4 dims, got {text_tokens_embed.ndim}."
             )
 
-            return sampled_action, idx, kv_cache_state
+        if text_tokens_embed.shape[0] == 1 and batch_size != 1:
+            text_tokens_embed = text_tokens_embed.expand(batch_size, -1, -1, -1)
+        if text_tokens_embed.shape[1] == 1 and n_steps != 1:
+            text_tokens_embed = text_tokens_embed.expand(-1, n_steps, -1, -1)
 
-        with torch.inference_mode():
-            return _predict(frame, idx, kv_cache_state, unif_rand, text_tokens_embed)
+        eager_assert(
+            text_tokens_embed.shape,
+            (batch_size, n_steps, self.text_token_size, text_dim),
+        )
+        return text_tokens_embed.float()
 
-    # Used for exporting to TensorRT since we can't
-    # include the distribution sampling and kv cache (for the moment)
-    # in trt.
-    def online_full_predict_logits(
+    def online_full_predict_actions(
         self,
         frames: torch.Tensor,
         actions: torch.Tensor,
@@ -394,21 +429,35 @@ class PolicyModelTrainer(ModelFreePolicy):
     ) -> torch.Tensor:
         frames = self._normalize_frames(frames)
         B, T = frames.shape[0], frames.shape[1]
-        action_in = self.action_in_to_tokens(actions)
-        action_out, *_ = self.transformer_forward_function(
-            frames, action_in, text_tokens_embed
+        text_tokens_embed = self._prepare_text_tokens_embed_for_inference(
+            batch_size=B,
+            n_steps=T,
+            device=frames.device,
+            text_tokens_embed=text_tokens_embed,
         )
-        action_logits = self.action_out_tokens_to_logits(action_out)
-        eager_assert(
-            action_logits.keys.shape,
-            (
-                B,
-                T,
-                self.n_keyboard_actions,
-                self.n_keyboard_choices,
-            ),
+        action_embeddings_in = self.action_in_to_tokens(actions)
+        action_out_embeddings, action_out_tokens, *_ = self.transformer_forward_function(
+            frames, action_embeddings_in, text_tokens_embed
         )
-        return action_logits
+        action_preds = self.action_tokens_to_actions(
+            action_out_embeddings,
+            action_out_tokens,
+            text_tokens_embed,
+        )
+        eager_assert(action_preds.shape, (B, T, self.n_actions))
+        return action_preds
+
+    def online_full_predict_logits(
+        self,
+        frames: torch.Tensor,
+        actions: torch.Tensor,
+        text_tokens_embed: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.online_full_predict_actions(
+            frames=frames,
+            actions=actions,
+            text_tokens_embed=text_tokens_embed,
+        )
 
     def online_full_predict(
         self,
@@ -416,89 +465,36 @@ class PolicyModelTrainer(ModelFreePolicy):
         actions: torch.Tensor,
         kv_cache_state: List[KVCacheState] = None,
         sampling_temperature: float = 1.0,
-        text_tokens_embed: Optional[str] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        text_tokens_embed: Optional[torch.Tensor] = None,
+        compile: bool = True,
+    ) -> torch.Tensor:
+        del kv_cache_state, sampling_temperature
+
         @(torch.compile(fullgraph=True) if compile else lambda f: f)
-        def _predict(frames, actions, kv_cache_state, text_tokens_embed):
-            T = frames.shape[1]
-            action_logits = self.online_full_predict_logits(
-                frames, actions, text_tokens_embed
+        def _predict(frames, actions, text_tokens_embed):
+            return self.online_full_predict_actions(
+                frames=frames,
+                actions=actions,
+                text_tokens_embed=text_tokens_embed,
             )
-
-            key_idx = _sample_from_logits_gpu(
-                action_logits.keys,
-                sampling_temperature,
-                None,
-                top_p=self.top_p,
-            ).squeeze(-1)
-
-            mouse_button_idx = _sample_from_logits_gpu(
-                action_logits.mouse_buttons,
-                sampling_temperature,
-                None,
-                top_p=self.top_p,
-            ).squeeze(-1)
-
-            mouse_delta_x_idx = _sample_from_logits_gpu(
-                action_logits.mouse_delta_x,
-                sampling_temperature,
-                None,
-                top_p=self.top_p,
-            ).squeeze(-1)
-
-            mouse_delta_y_idx = _sample_from_logits_gpu(
-                action_logits.mouse_delta_y,
-                sampling_temperature,
-                None,
-                top_p=self.top_p,
-            ).squeeze(-1)
-
-            action_out = StructuredAction(
-                keys=key_idx,
-                mouse_buttons=mouse_button_idx,
-                mouse_delta_x=mouse_delta_x_idx,
-                mouse_delta_y=mouse_delta_y_idx,
-            )
-
-            eager_assert(action_out.keys.shape, (1, T, self.n_keyboard_actions))
-            return action_out, action_logits
 
         with torch.inference_mode():
-            return _predict(frames, actions, kv_cache_state, text_tokens_embed)
+            return _predict(frames, actions, text_tokens_embed)
 
     def action_in_to_tokens(
-        self, action_in: StructuredAction, idx: Optional[torch.Tensor] = None
+        self, action_in: torch.Tensor, idx: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        If idx is provided, this will return dummy actions that match the shape of the frame input.
-        If idx is not provided, this will return the actual actions embeddings.
-        """
-        B, T, _ = action_in.keys.shape
-        eager_assert(action_in.keys.shape, (B, T, self.n_keyboard_actions))
-        eager_assert(action_in.mouse_buttons.shape, (B, T, self.n_mouse_button_actions))
-        eager_assert(action_in.mouse_delta_x.shape, (B, T, 1))
-        eager_assert(action_in.mouse_delta_y.shape, (B, T, 1))
+        """Project continuous robot actions into action tokens."""
+        B, T, D = action_in.shape
+        eager_assert(action_in.shape, (B, T, self.n_actions))
 
         if idx is None:
-            idx = torch.arange(B)
-        key_action_embedding = self.key_action_embedding(action_in.keys[idx])
-        mouse_button_embedding = self.mouse_button_embedding(
-            action_in.mouse_buttons[idx]
-        )
-        mouse_delta_x_embedding = self.mouse_delta_x_embedding(
-            action_in.mouse_delta_x[idx]
-        )
-        mouse_delta_y_embedding = self.mouse_delta_y_embedding(
-            action_in.mouse_delta_y[idx]
-        )
-        action_embedding = torch.cat(
-            [
-                key_action_embedding,
-                mouse_button_embedding,
-                mouse_delta_x_embedding,
-                mouse_delta_y_embedding,
-            ],
-            dim=2,
+            action_subset = action_in
+        else:
+            action_subset = action_in[idx]
+
+        action_embedding = self.robot_action_in_proj(
+            action_subset.unsqueeze(-1).to(torch.bfloat16)
         )
         eager_assert(
             action_embedding.shape,
@@ -511,79 +507,75 @@ class PolicyModelTrainer(ModelFreePolicy):
         )
         return action_embedding
 
+    def action_tokens_to_actions(
+        self,
+        action_out_embeddings: torch.Tensor,
+        action_out_tokens: torch.Tensor,
+        text_tokens_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        B, T, N, _ = action_out_embeddings.shape
+        eager_assert(N, self.n_actions)
+        eager_assert(
+            action_out_tokens.shape,
+            (B, T, self.config.policy_model.transformer_dim),
+        )
+        eager_assert(
+            text_tokens_embed.shape,
+            (
+                B,
+                T,
+                self.text_token_size,
+                self._get_text_embedding_dim(),
+            ),
+        )
+
+        action_tokens_for_rdt = self.policy_action_to_rdt_proj(
+            action_out_embeddings.to(torch.bfloat16)
+        )
+        eager_assert(
+            action_tokens_for_rdt.shape,
+            (B, T, self.n_actions, self.rdt_hidden_size),
+        )
+
+        state_tokens = self.policy_summary_to_rdt_state_proj(
+            action_out_tokens.to(torch.bfloat16)
+        ).reshape(B * T, 1, self.rdt_hidden_size)
+        eager_assert(state_tokens.shape, (B * T, 1, self.rdt_hidden_size))
+
+        text_condition = self.text_condition_to_rdt_proj(
+            text_tokens_embed.to(torch.bfloat16)
+        )
+        eager_assert(
+            text_condition.shape,
+            (B, T, self.text_token_size, self.rdt_hidden_size),
+        )
+        text_condition = text_condition.reshape(
+            B * T, self.text_token_size, self.rdt_hidden_size
+        )
+        text_condition_mask = text_tokens_embed.abs().sum(dim=-1).reshape(
+            B * T, self.text_token_size
+        ) > 0
+
+        action_preds = self.rdt_policy_head(
+            x=action_tokens_for_rdt.reshape(
+                B * T, self.n_actions, self.rdt_hidden_size
+            ),
+            t=torch.zeros(B * T, device=action_out_embeddings.device, dtype=torch.long),
+            act_c=text_condition,
+            state_c=state_tokens,
+            act_mask=text_condition_mask,
+            decode_output=True,
+        ).squeeze(-1)
+        eager_assert(action_preds.shape, (B * T, self.n_actions))
+        action_preds = action_preds.reshape(B, T, self.n_actions)
+        eager_assert(action_preds.shape, (B, T, self.n_actions))
+        return action_preds
+
     def action_out_tokens_to_logits(
         self, action_out_tokens: torch.Tensor
     ) -> torch.Tensor:
-        # Any changes here should be reflected in the online_kv_cache_predict function.
-
-        B, T, N, D = action_out_tokens.shape
-        eager_assert(N, self.n_actions)
-
-        key_logits = self.keyboard_out_logits(
-            action_out_tokens[:, :, : self.n_keyboard_actions, :]
-        )
-        eager_assert(
-            key_logits.shape,
-            (
-                B,
-                T,
-                self.n_keyboard_actions,
-                self.action_mapping.get_number_of_keyboard_choices(),
-            ),
-        )
-        mouse_button_logits = self.mouse_button_out_logits(
-            action_out_tokens[
-                :,
-                :,
-                self.n_keyboard_actions : self.n_keyboard_actions
-                + self.n_mouse_button_actions,
-                :,
-            ]
-        )
-        eager_assert(
-            mouse_button_logits.shape,
-            (
-                B,
-                T,
-                self.n_mouse_button_actions,
-                self.action_mapping.get_number_of_mouse_button_choices(),
-            ),
-        )
-        mouse_delta_x_logits = self.mouse_delta_x_out_logits(
-            action_out_tokens[
-                :,
-                :,
-                self.n_keyboard_actions
-                + self.n_mouse_button_actions : self.n_keyboard_actions
-                + self.n_mouse_button_actions
-                + 1,
-                :,
-            ]
-        )
-        eager_assert(
-            mouse_delta_x_logits.shape,
-            (B, T, 1, self.action_mapping.get_n_mouse_x_bins()),
-        )
-        mouse_delta_y_logits = self.mouse_delta_y_out_logits(
-            action_out_tokens[
-                :,
-                :,
-                self.n_keyboard_actions
-                + self.n_mouse_button_actions
-                + 1 : self.n_keyboard_actions + self.n_mouse_button_actions + 2,
-                :,
-            ]
-        )
-        eager_assert(
-            mouse_delta_y_logits.shape,
-            (B, T, 1, self.action_mapping.get_n_mouse_y_bins()),
-        )
-
-        return StructuredAction(
-            keys=key_logits,
-            mouse_buttons=mouse_button_logits,
-            mouse_delta_x=mouse_delta_x_logits,
-            mouse_delta_y=mouse_delta_y_logits,
+        raise RuntimeError(
+            "Discrete action logits are not available in the LeRobot + RDT training path. Use action_tokens_to_actions() instead."
         )
 
     def on_before_optimizer_step(self, optimizer):
@@ -631,12 +623,7 @@ class PolicyModelTrainer(ModelFreePolicy):
         )
 
     def _calculate_loss(self, batch, actions_in, masked_labels, text_tokens_embed):
-        """
-        Calculate the loss for the given batch of actions.
-        batch: batch from dataloader
-        actions_in: action sequence correspond to frames, use ground truth action for labeled data and pseudo labels for unlabeled data
-        masked_labels: action sequence masked with user action mask, same as action_in for unlabeled data
-        """
+        """Calculate the regression loss for continuous robot actions."""
         frames = self._normalize_frames(batch.frames)
         batch_size = batch.frames.shape[0]
         T = batch.frames.shape[1]
@@ -650,7 +637,7 @@ class PolicyModelTrainer(ModelFreePolicy):
                 self.config.policy_model.action_decoder.embed_dim,
             ),
         )
-        action_out_embeddings, _, auxiliary_losses, auxiliary_outputs = (
+        action_out_embeddings, action_out_tokens, auxiliary_losses, auxiliary_outputs = (
             self.transformer_forward_function(
                 frames, action_embeddings_in, text_tokens_embed
             )
@@ -665,80 +652,34 @@ class PolicyModelTrainer(ModelFreePolicy):
             ),
         )
 
-        action_logits = self.action_out_tokens_to_logits(action_out_embeddings)
+        action_preds = self.action_tokens_to_actions(
+            action_out_embeddings,
+            action_out_tokens,
+            text_tokens_embed,
+        )
+        action_targets = masked_labels["targets"]
+        action_mask = masked_labels["mask"].to(action_preds.dtype)
+        squared_error = (action_preds - action_targets).pow(2)
+        denom = action_mask.sum().clamp_min(1.0)
+        robot_action_mse = (squared_error * action_mask).sum() / denom
 
-        eager_assert(
-            action_logits.keys.shape,
-            (batch_size, T, self.n_keyboard_actions, self.n_keyboard_choices),
+        lb_loss = auxiliary_losses.get(
+            "lb_loss", torch.tensor(0.0, device=frames.device)
         )
-        eager_assert(
-            action_logits.mouse_buttons.shape,
-            (batch_size, T, self.n_mouse_button_actions, self.n_mouse_button_choices),
+        rz_loss = auxiliary_losses.get(
+            "rz_loss", torch.tensor(0.0, device=frames.device)
         )
-        eager_assert(
-            action_logits.mouse_delta_x.shape,
-            (batch_size, T, 1, self.n_mouse_x_bins),
-        )
-        eager_assert(
-            action_logits.mouse_delta_y.shape,
-            (batch_size, T, 1, self.n_mouse_y_bins),
-        )
-
-        key_loss = F.cross_entropy(
-            input=action_logits.keys.view(-1, self.n_keyboard_choices),
-            target=masked_labels.keys.view(-1),
-            ignore_index=-100,
-        )
-        mouse_button_loss = F.cross_entropy(
-            input=action_logits.mouse_buttons.view(-1, self.n_mouse_button_choices),
-            target=masked_labels.mouse_buttons.view(-1),
-            ignore_index=-100,
-        )
-        mouse_delta_x_loss = F.cross_entropy(
-            input=action_logits.mouse_delta_x.view(-1, self.n_mouse_x_bins),
-            target=masked_labels.mouse_delta_x.view(-1),
-            ignore_index=-100,
-        )
-        mouse_delta_y_loss = F.cross_entropy(
-            input=action_logits.mouse_delta_y.view(-1, self.n_mouse_y_bins),
-            target=masked_labels.mouse_delta_y.view(-1),
-            ignore_index=-100,
-        )
-        lb_loss = auxiliary_losses.get("lb_loss", torch.tensor(0.0))
-        rz_loss = auxiliary_losses.get("rz_loss", torch.tensor(0.0))
         losses = {
-            "key": key_loss,
-            "mouse_button": mouse_button_loss,
-            "mouse_delta_x": mouse_delta_x_loss,
-            "mouse_delta_y": mouse_delta_y_loss,
+            "robot_action_mse": robot_action_mse,
             "lb_loss": lb_loss,
             "rz_loss": rz_loss,
         }
-        key_z_loss, mouse_button_z_loss, mouse_delta_x_z_loss, mouse_delta_y_z_loss = (
-            self._calculate_z_loss(action_logits, masked_labels)
-        )
         loss = (
-            (key_loss) / torch.log(torch.tensor(self.n_keyboard_choices))
-            + (mouse_button_loss) / torch.log(torch.tensor(self.n_mouse_button_choices))
-            + (mouse_delta_x_loss) / torch.log(torch.tensor(self.n_mouse_x_bins))
-            + (mouse_delta_y_loss) / torch.log(torch.tensor(self.n_mouse_y_bins))
-            + (
-                key_z_loss
-                + mouse_button_z_loss
-                + mouse_delta_x_z_loss
-                + mouse_delta_y_z_loss
-            )
-            * self.z_loss_weight
+            robot_action_mse
             + lb_loss * self.lb_loss_weight
             + rz_loss * self.rz_loss_weight
         )
-        cross_entropy_loss = (
-            key_loss / torch.log(torch.tensor(self.n_keyboard_choices))
-            + mouse_button_loss / torch.log(torch.tensor(self.n_mouse_button_choices))
-            + mouse_delta_x_loss / torch.log(torch.tensor(self.n_mouse_x_bins))
-            + mouse_delta_y_loss / torch.log(torch.tensor(self.n_mouse_y_bins))
-        )
-        return loss, cross_entropy_loss, losses, auxiliary_outputs
+        return loss, robot_action_mse, losses, auxiliary_outputs
 
     def _create_target_and_masked_labels(self, batch):
         batch_size = batch.frames.shape[0]
@@ -750,35 +691,15 @@ class PolicyModelTrainer(ModelFreePolicy):
         eager_assert(valid_frame_mask.shape, (batch_size, T))
         eager_assert(system_action_mask.shape, (batch_size, T))
 
-        # If not using IDM
-        # only compute loss on frames that are both user-labeled and valid
         effective_mask = self._compute_effective_mask(
             user_action_mask, valid_frame_mask, system_action_mask
         )
-        # effective_mask = user_action_mask & valid_frame_mask
-        actions_in = batch.action_annotations
-        masked_labels = StructuredAction(
-            keys=torch.where(
-                effective_mask.unsqueeze(2),
-                batch.action_annotations.keys,
-                -100,
-            ),
-            mouse_buttons=torch.where(
-                effective_mask.unsqueeze(2),
-                batch.action_annotations.mouse_buttons,
-                -100,
-            ),
-            mouse_delta_x=torch.where(
-                effective_mask.unsqueeze(2),
-                batch.action_annotations.mouse_delta_x,
-                -100,
-            ),
-            mouse_delta_y=torch.where(
-                effective_mask.unsqueeze(2),
-                batch.action_annotations.mouse_delta_y,
-                -100,
-            ),
-        )
+        actions_in = batch.action_annotations.float()
+        action_mask = effective_mask.unsqueeze(-1).expand_as(actions_in)
+        masked_labels = {
+            "targets": batch.action_annotations.float(),
+            "mask": action_mask,
+        }
         ratio_unlabeled = torch.zeros(
             (), dtype=torch.float32, device=user_action_mask.device
         )
@@ -806,6 +727,28 @@ class PolicyModelTrainer(ModelFreePolicy):
         # frames = torch.cond(should_augment, _augment_fn, _no_augment_fn, (frames,))
         return batch._replace(frames=frames)
 
+    def _validate_batch_sequence_length(self, batch):
+        expected_seq_len = self.config.shared.n_seq_timesteps
+        lengths = {
+            "frames": batch.frames.shape[1],
+            "action_annotations": batch.action_annotations.shape[1],
+            "user_action_mask": batch.user_action_mask.shape[1],
+            "system_action_mask": batch.system_action_mask.shape[1],
+            "text_embeddings": batch.text_embeddings.shape[1],
+        }
+        if batch.valid_frame_mask is not None:
+            lengths["valid_frame_mask"] = batch.valid_frame_mask.shape[1]
+
+        mismatched = {
+            name: length
+            for name, length in lengths.items()
+            if length != expected_seq_len
+        }
+        if mismatched:
+            raise ValueError(
+                f"Batch sequence length must match shared.n_seq_timesteps={expected_seq_len}, got {mismatched}."
+            )
+
     def training_step(self, batch, batch_idx):
         if self.trainer.global_step == 0:
             logging.info(
@@ -813,6 +756,7 @@ class PolicyModelTrainer(ModelFreePolicy):
             )
 
         batch = self._apply_augmentations(batch)
+        self._validate_batch_sequence_length(batch)
         text_tokens_embed = batch.text_embeddings
 
         @self.compile_mode
@@ -821,15 +765,14 @@ class PolicyModelTrainer(ModelFreePolicy):
                 actions_in, masked_labels, ratio_unlabeled = (
                     self._create_target_and_masked_labels(batch)
                 )
-            # The actual optimization happens here.
-            loss, cross_entropy_loss, losses, auxiliary_outputs = self._calculate_loss(
+            loss, robot_action_mse, losses, auxiliary_outputs = self._calculate_loss(
                 batch, actions_in, masked_labels, text_tokens_embed
             )
 
             auxiliary_outputs["ratio_unlabeled"] = ratio_unlabeled
-            return loss, losses, cross_entropy_loss, auxiliary_outputs
+            return loss, losses, robot_action_mse, auxiliary_outputs
 
-        loss, losses, cross_entropy_loss, auxiliary_outputs = compiled_training_step(
+        loss, losses, robot_action_mse, auxiliary_outputs = compiled_training_step(
             batch
         )
 
@@ -842,61 +785,69 @@ class PolicyModelTrainer(ModelFreePolicy):
         self._training_ratio_unlabeled_metric.update(
             auxiliary_outputs["ratio_unlabeled"]
         )
-        self._training_cross_entropy_metric.update(cross_entropy_loss)
-        self._training_perplexity_metric.update(cross_entropy_to_perplexity(loss))
+        self._training_robot_action_mse_metric.update(robot_action_mse)
+        self._training_lb_loss_metric.update(losses["lb_loss"])
+        self._training_rz_loss_metric.update(losses["rz_loss"])
 
-        for k, v in losses.items():
-            getattr(self, f"_training_perplexity_{k}_metric").update(
-                cross_entropy_to_perplexity(v)
-            )
         for i in range(self.num_of_experts):
             metric = getattr(self, f"_training_expert_{i}_capacity_metric")
             metric.update(auxiliary_outputs["num_tokens_per_expert"][i])
 
-        # Only log on the final gradient accumulation step.
-        # if not self.trainer.fit_loop._should_accumulate():
-        # Accumulation gets weird at the end of the epoch.
-        # if self.trainer.fit_loop.epoch_loop._accumulated_batches_reached():
-        # TODO: proper fix, right not gradient accumulation does not work with DDP.
         if self.trainer.global_step % 50 == 0:
+            training_loss = self._training_loss_metric.compute()
+            training_robot_action_mse = self._training_robot_action_mse_metric.compute()
+            training_lb_loss = self._training_lb_loss_metric.compute()
+            training_rz_loss = self._training_rz_loss_metric.compute()
+            training_ratio_unlabeled = (
+                self._training_ratio_unlabeled_metric.compute()
+            )
+
+            if self.trainer.is_global_zero:
+                logging.info(
+                    "global_step=%s training_loss=%.6f training_robot_action_mse=%.6f training_lb_loss=%.6f training_rz_loss=%.6f training_ratio_unlabeled=%.6f",
+                    self.trainer.global_step,
+                    _metric_to_float(training_loss),
+                    _metric_to_float(training_robot_action_mse),
+                    _metric_to_float(training_lb_loss),
+                    _metric_to_float(training_rz_loss),
+                    _metric_to_float(training_ratio_unlabeled),
+                )
+
             self.log(
                 "training_loss",
-                self._training_loss_metric.compute(),
+                training_loss,
                 sync_dist=True,
                 add_dataloader_idx=False,
                 on_step=True,
             )
             self.log(
-                "training_cross_entropy",
-                self._training_cross_entropy_metric.compute(),
+                "training_robot_action_mse",
+                training_robot_action_mse,
                 sync_dist=True,
                 add_dataloader_idx=False,
                 on_step=True,
             )
             self.log(
-                "training_perplexity",
-                self._training_perplexity_metric.compute(),
+                "training_lb_loss",
+                training_lb_loss,
+                sync_dist=True,
+                add_dataloader_idx=False,
+                on_step=True,
+            )
+            self.log(
+                "training_rz_loss",
+                training_rz_loss,
                 sync_dist=True,
                 add_dataloader_idx=False,
                 on_step=True,
             )
             self.log(
                 "training_ratio_unlabeled",
-                self._training_ratio_unlabeled_metric.compute(),
+                training_ratio_unlabeled,
                 sync_dist=True,
                 add_dataloader_idx=False,
                 on_step=True,
             )
-            for k in losses.keys():
-                metric = getattr(self, f"_training_perplexity_{k}_metric")
-                self.log(
-                    f"training_perplexity_{k}",
-                    metric.compute(),
-                    sync_dist=True,
-                    add_dataloader_idx=False,
-                    on_step=True,
-                )
-                metric.reset()
             for i in range(self.num_of_experts):
                 metric = getattr(self, f"_training_expert_{i}_capacity_metric")
                 self.log(
@@ -908,12 +859,11 @@ class PolicyModelTrainer(ModelFreePolicy):
                 )
                 metric.reset()
             self._training_loss_metric.reset()
-            self._training_cross_entropy_metric.reset()
-            self._training_perplexity_metric.reset()
+            self._training_robot_action_mse_metric.reset()
+            self._training_lb_loss_metric.reset()
+            self._training_rz_loss_metric.reset()
             self._training_ratio_unlabeled_metric.reset()
 
-        # Record the total number of frames seen in training.
-        # This depends on the number of optimizer steps (global_step), number of devices, and batch size per device.
         B, T = batch.frames.shape[0], batch.frames.shape[1]
         n_global_training_frames = (
             self.trainer.global_step
@@ -932,30 +882,26 @@ class PolicyModelTrainer(ModelFreePolicy):
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        self._validate_batch_sequence_length(batch)
         text_tokens_embed = batch.text_embeddings
 
         @self.compile_mode
         def _compiled_validation_step(batch, text_tokens_embed):
             actions_in, masked_labels, _ = self._create_target_and_masked_labels(batch)
-            loss, _, losses, auxiliary_outputs = self._calculate_loss(
+            loss, robot_action_mse, losses, auxiliary_outputs = self._calculate_loss(
                 batch, actions_in, masked_labels, text_tokens_embed
             )
-            return loss, losses, auxiliary_outputs
+            return loss, robot_action_mse, losses, auxiliary_outputs
 
-        loss, losses, auxiliary_outputs = _compiled_validation_step(
+        loss, robot_action_mse, losses, auxiliary_outputs = _compiled_validation_step(
             batch, text_tokens_embed
         )
         val_set_name = list(self.trainer.val_dataloaders.keys())[dataloader_idx]
         val_metrics = self._validation_metrics[val_set_name]
-        val_metrics["perplexity"].update(cross_entropy_to_perplexity(loss))
-        val_metrics["perplexity_rz_loss"].update(
-            cross_entropy_to_perplexity(losses["rz_loss"])
-        )
-        val_metrics["perplexity_lb_loss"].update(
-            cross_entropy_to_perplexity(losses["lb_loss"])
-        )
-        for k, v in losses.items():
-            val_metrics[f"perplexity_{k}"].update(cross_entropy_to_perplexity(v))
+        val_metrics["loss"].update(loss)
+        val_metrics["robot_action_mse"].update(robot_action_mse)
+        val_metrics["lb_loss"].update(losses["lb_loss"])
+        val_metrics["rz_loss"].update(losses["rz_loss"])
         for i in range(self.num_of_experts):
             val_metrics[f"expert_{i}_capacity"].update(
                 auxiliary_outputs["num_tokens_per_expert"][i]
@@ -1089,33 +1035,24 @@ class SupervisedDataModule(pl.LightningDataModule):
             text_annotation_model_version=self.cfg.shared.text_tokenizer_config.text_annotation_model_version,
         )
 
-    def _init_train_dataset(self):
-        return ActionLabelVideoProtoDataset(
-            ActionLabelVideoProtoDatasetConfig(
-                frame_height=self.cfg.shared.frame_height,
-                frame_width=self.cfg.shared.frame_width,
-                local_prefix=self.training_dataset_cfg.local_prefix,
-                shuffle=True,
-                T=self.cfg.shared.n_seq_timesteps,
-                shuffle_buffer_size=self.training_dataset_cfg.shuffle_buffer_size_per_gpu
-                * self.world_size,
-                n_preprocess_workers_per_iter_worker=self.training_dataset_cfg.n_preprocess_threads_per_gpu,
-                preprocessed_chunks_queue_size=self.training_dataset_cfg.preprocessed_chunks_queue_size_per_gpu,
-                warn_on_starvation=self.training_dataset_cfg.warn_on_starvation,
-                action_mapping=self.cfg.shared.action_mapping,
-                always_labelled=self.training_dataset_cfg.always_labelled,
-                rand_augmentation=self.training_dataset_cfg.rand_augmentation,
-                drop_chunks_with_only_system_actions=self._should_drop_chunks_with_only_system_actions(),
-                batch_size=self.training_dataset_cfg.batch_size,
-                shuffled_chunks_queue_size=self.training_dataset_cfg.shuffled_chunks_queue_size_per_gpu,
-                dataset_worker_prefetch_factor=self.training_dataset_cfg.dataset_worker_prefetch_factor,
-                # We don't need to multiple this by num_gpus because dataset will be run multiple times.
-                dataset_worker_num_workers=self.training_dataset_cfg.dataset_worker_num_workers_per_gpu,
-                dataset_unique_id="training_dataset",
-                text_tokenizer_config=self.text_tokenizer_config,
-            ),
-            device="cpu",
+    def _make_dataloader(self, dataset, dataset_cfg: DatasetConfig, shuffle: bool):
+        dataloader_kwargs = dict(
+            dataset=dataset,
+            batch_size=dataset_cfg.batch_size,
+            shuffle=shuffle,
+            num_workers=dataset_cfg.dataset_worker_num_workers_per_gpu,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=dataset_cfg.dataset_worker_num_workers_per_gpu > 0,
         )
+        if dataset_cfg.dataset_worker_num_workers_per_gpu > 0:
+            dataloader_kwargs["prefetch_factor"] = (
+                dataset_cfg.dataset_worker_prefetch_factor
+            )
+        return DataLoader(**dataloader_kwargs)
+
+    def _init_train_dataset(self):
+        return MultiLatentLeRobotDataset(self.training_dataset_cfg)
 
     def _init_dummy_dataset(self):
         return DummyDataset(
@@ -1128,73 +1065,35 @@ class SupervisedDataModule(pl.LightningDataModule):
         )
 
     def setup(self, stage: str):
-        try:
-            self.global_rank = self.trainer.global_rank
-            self.world_size = self.trainer.world_size
+        self.global_rank = getattr(self.trainer, "global_rank", 0)
+        self.world_size = getattr(self.trainer, "world_size", 1)
+        logging.info(
+            f"Setting up datasets. global_rank: {self.global_rank}, world_size: {self.world_size}, stage {stage}"
+        )
+        if self._setup_completed:
             logging.info(
-                f"Setting up datasets. global_rank: {self.global_rank}, world_size: {self.world_size}, stage {stage}"
+                f"Setup already completed. global_rank: {self.global_rank}, world_size: {self.world_size}, stage {stage}"
             )
-            if self._setup_completed:
-                logging.info(
-                    f"Setup already completed. global_rank: {self.global_rank}, world_size: {self.world_size}, stage {stage}"
-                )
-                self.train_dataset._dataset_worker_generation += 1
-                logging.info(
-                    f"Train dataset worker generation: {self.train_dataset._dataset_worker_generation}, rank: {self.global_rank}"
-                )
-                for k, v in self.validation_datasets.items():
-                    v._dataset_worker_generation += 1
-                    logging.info(
-                        f"Validation dataset {k} worker generation: {v._dataset_worker_generation}, rank: {self.global_rank}"
-                    )
-                return
-            self._setup_completed = True
+            return
+        self._setup_completed = True
 
-            # You can use the dummy dataset for testing speed.
-            # self.train_dataset = self._init_dummy_dataset()
-            self.train_dataset = self._init_train_dataset()
-            self._train_dataloader = self.train_dataset.to_dataloader()
-        except Exception as e:
-            logging.warning(
-                f"this warning should only happen during offline validaiton."
-            )
-            self.world_size = 1
+        self.train_dataset = self._init_train_dataset()
+        self._train_dataloader = self._make_dataloader(
+            self.train_dataset,
+            self.training_dataset_cfg,
+            shuffle=self.training_dataset_cfg.shuffle,
+        )
 
         self.validation_datasets = {}
         for i, validation_dataset_cfg in enumerate(self.validation_dataset_cfgs):
-            validation_dataset = ActionLabelVideoProtoDataset(
-                ActionLabelVideoProtoDatasetConfig(
-                    frame_height=self.cfg.shared.frame_height,
-                    frame_width=self.cfg.shared.frame_width,
-                    local_prefix=validation_dataset_cfg.local_prefix,
-                    shuffle=False,
-                    T=self.cfg.shared.n_seq_timesteps,
-                    shuffle_buffer_size=validation_dataset_cfg.shuffle_buffer_size_per_gpu
-                    * self.world_size,
-                    n_preprocess_workers_per_iter_worker=validation_dataset_cfg.n_preprocess_threads_per_gpu,
-                    preprocessed_chunks_queue_size=validation_dataset_cfg.preprocessed_chunks_queue_size_per_gpu,
-                    # For validation we always use only human data.
-                    drop_chunks_with_only_system_actions=self._should_drop_chunks_with_only_system_actions(),
-                    warn_on_starvation=validation_dataset_cfg.warn_on_starvation,
-                    action_mapping=self.cfg.shared.action_mapping,
-                    always_labelled=validation_dataset_cfg.always_labelled,
-                    rand_augmentation=validation_dataset_cfg.rand_augmentation,
-                    ignore_iterator_reset=True,
-                    batch_size=validation_dataset_cfg.batch_size,
-                    dataset_worker_prefetch_factor=validation_dataset_cfg.dataset_worker_prefetch_factor,
-                    dataset_worker_num_workers=validation_dataset_cfg.dataset_worker_num_workers_per_gpu,
-                    shuffled_chunks_queue_size=validation_dataset_cfg.shuffled_chunks_queue_size_per_gpu,
-                    dataset_unique_id=f"{validation_dataset_cfg.validation_name}_{i}",
-                    text_tokenizer_config=self.text_tokenizer_config,
-                ),
-                device="cpu",
-            )
+            validation_dataset = MultiLatentLeRobotDataset(validation_dataset_cfg)
             self.validation_datasets[validation_dataset_cfg.validation_name] = (
                 validation_dataset
             )
 
         self._val_dataloaders = {
-            k: d.to_dataloader() for k, d in self.validation_datasets.items()
+            k: self._make_dataloader(d, self.validation_dataset_cfgs[i], shuffle=False)
+            for i, (k, d) in enumerate(self.validation_datasets.items())
         }
 
     def train_dataloader(self):
@@ -1204,9 +1103,10 @@ class SupervisedDataModule(pl.LightningDataModule):
         return self._val_dataloaders
 
     def get_action_mapping(self):
-        return UniversalAutoregressiveActionMapping(
-            config=self.cfg.shared.action_mapping
-        )
+        return {
+            "action_type": "robot_continuous",
+            "robot_action_dim": self.training_dataset_cfg.get_robot_action_dim(),
+        }
 
 
 class Stage3DataModule(SupervisedDataModule):
@@ -1223,6 +1123,11 @@ class Stage3DataModule(SupervisedDataModule):
 
 
 def train_stage3_finetune(config: LightningPolicyConfig):
+    _sync_sequence_length_with_dataset(config)
+    _sync_text_embedding_shape_with_dataset(config)
+    resume_ckpt_path = _resolve_resume_checkpoint_path(config)
+    if resume_ckpt_path is not None:
+        _validate_resume_checkpoint_compatibility(resume_ckpt_path, config)
     datamodule = Stage3DataModule(config)
     # This is for start_experiment.py type jobs
     run_id = getattr(config.wandb, "run_id", None) or os.environ.get("WANDB_RUN_ID")
@@ -1304,7 +1209,10 @@ def train_stage3_finetune(config: LightningPolicyConfig):
         f"Total parameters: {total_params}, Expert parameters: {expert_params}"
     )
 
-    trainer.fit(model, datamodule)
+    if resume_ckpt_path is not None:
+        logging.info("Resuming stage3 training from checkpoint: %s", resume_ckpt_path)
+
+    trainer.fit(model, datamodule, ckpt_path=resume_ckpt_path)
 
     wandb_logger.experiment.finish()
     return async_checkpointer.get_final_checkpoint()

@@ -41,6 +41,53 @@ class DatasetConfig(ConfigBase):
         default=["gemini-2.5-flash", "gemini-2.5-flash-thinking-0905"]
     )
 
+    # LeRobot-specific fields used by MultiLatentLeRobotDataset.
+    dataset_path: str = ""
+    empty_emb_path: str = ""
+    cfg_prob: float = 0.0
+    obs_cam_keys: List[str] = pydantic.Field(default_factory=list)
+    norm_stat: dict = pydantic.Field(default_factory=dict)
+    image_height: int = 192
+    image_width: int = 192
+    image_frame_stride: int = 1
+    dataset_mp_start_method: str = "spawn"
+    used_action_channel_ids: List[int] = pydantic.Field(default_factory=list)
+    inverse_used_action_channel_ids: List[int] = pydantic.Field(default_factory=list)
+    action_dim: Optional[int] = None
+    dataset_init_worker: int = 8
+    single_task: Optional[str] = None
+    multi_view_image_mode: Literal["vertical", "frame", "first"] = "vertical"
+    text_embedding_shape: List[int] = pydantic.Field(default_factory=lambda: [1, 1])
+    robot_action_dim: Optional[int] = None
+
+    def model_post_init(self, __context) -> None:
+        if not self.used_action_channel_ids:
+            return
+
+        if self.action_dim is None:
+            self.action_dim = max(self.used_action_channel_ids) + 1
+
+        inverse_used_action_channel_ids = [
+            len(self.used_action_channel_ids)
+        ] * self.action_dim
+        for i, j in enumerate(self.used_action_channel_ids):
+            inverse_used_action_channel_ids[j] = i
+        self.inverse_used_action_channel_ids = inverse_used_action_channel_ids
+
+        if self.robot_action_dim is None:
+            self.robot_action_dim = self.action_dim
+
+    def get_robot_action_dim(self) -> int:
+        if self.robot_action_dim is not None:
+            return self.robot_action_dim
+        if self.action_dim is not None:
+            return self.action_dim
+        if not self.inverse_used_action_channel_ids:
+            raise ValueError(
+                "robot_action_dim is not set and inverse_used_action_channel_ids is empty."
+            )
+        return len(self.inverse_used_action_channel_ids) * self.image_frame_stride
+
 
 class ValidationDatasetConfig(DatasetConfig):
     validation_name: str
@@ -64,6 +111,18 @@ class ActionDecoderConfig(ConfigBase):
     n_transformer_layers: int = 3
 
 
+class RDTConfig(ConfigBase):
+    hidden_size: int = 256
+    depth: int = 4
+    num_heads: int = 8
+    num_kv_heads: Optional[int] = None
+    norm_eps: float = 1e-5
+    multiple_of: int = 256
+    ffn_dim_multiplier: Optional[float] = None
+    use_flash_attn: bool = True
+    num_register_tokens: int = 4
+
+
 class TransformerModelConfig(ConfigBase):
     transformer_dim: int = 128
     n_transformer_layers: int = 4
@@ -76,6 +135,7 @@ class TransformerModelConfig(ConfigBase):
 
 
 class PolicyModelConfig(TransformerModelConfig):
+    rdt: RDTConfig = RDTConfig()
     mask_block_size: Optional[int] = None
     attention_history_len: List[int] = [
         100,

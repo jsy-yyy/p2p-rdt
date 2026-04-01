@@ -34,7 +34,9 @@ class ModelFreePolicy(pl.LightningModule):
         )
 
         # for stage2 and stage3 policy model, the model attend to real actions
-        self.transformer_n_action_tokens = self.action_mapping.get_seq_len()
+        self.transformer_n_action_tokens = (
+            self.config.stage3_finetune.training_dataset.get_robot_action_dim()
+        )
         self.text_token_size = (
             self.config.shared.text_tokenizer_config.text_embedding_shape[0]
         )
@@ -71,7 +73,7 @@ class ModelFreePolicy(pl.LightningModule):
                     sparse_moe=sparse_moe_config,
                     action_decoder=ActionDecoderConfig(
                         embed_dim=config.policy_model.action_decoder.embed_dim,
-                        n_action_tokens=self.action_mapping.get_seq_len() + 1,
+                        n_action_tokens=self.transformer_n_action_tokens + 1,
                         input_action_token_dim=config.policy_model.transformer_dim,
                     ),
                 ),
@@ -93,7 +95,7 @@ class ModelFreePolicy(pl.LightningModule):
                     model_type=config.policy_model.model_type,
                     action_decoder=ActionDecoderConfig(
                         embed_dim=config.policy_model.action_decoder.embed_dim,
-                        n_action_tokens=self.action_mapping.get_seq_len() + 1,
+                        n_action_tokens=self.transformer_n_action_tokens + 1,
                         input_action_token_dim=config.policy_model.transformer_dim,
                     ),
                     n_kv_sink_tokens=config.policy_model.n_kv_sink_tokens,
@@ -106,7 +108,7 @@ class ModelFreePolicy(pl.LightningModule):
                 mask_fn=self._get_transformer_mask_fn(),
             )
 
-        self.action_seq_len = self.action_mapping.get_seq_len()
+        self.action_seq_len = self.transformer_n_action_tokens
 
     def _get_transformer_mask_fn(self):
         raise NotImplementedError("Subclasses must implement _get_transformer_mask_fn")

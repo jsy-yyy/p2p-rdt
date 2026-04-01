@@ -11,3 +11,6 @@ yt_videos/
 target
 data_folder/
 data_folder_validation/
+train_out
+*.md
+*.log

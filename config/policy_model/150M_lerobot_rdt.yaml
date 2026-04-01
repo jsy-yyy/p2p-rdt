@@ -1,0 +1,93 @@
+shared:
+  output_path: /data/jsy/open-p2p/train_out/150M_lerobot_rdt_dim30
+  n_seq_timesteps: 200
+  frame_height: &frame_height 192
+  frame_width: &frame_width 192
+  precision: bf16-mixed
+  text_tokenizer_config:
+    text_tokenizer_name: "gemma"
+    text_embedding_shape: [1, 4096]
+    text_annotation_model_version: ["gemini-2.5-flash", "gemini-2.5-flash-thinking-0905"]
+  tokenizer:
+    type: "conv"
+    conv_tokenizer_config:
+      num_tokens: 1
+
+inference:
+  mouse_sampling_approach: "truncated_normal"
+
+policy_model:
+  n_transformer_layers: 10
+  n_q_head: 16
+  n_kv_head: 16
+  n_thinking_tokens: 1
+  transformer_dim: &transformer_dim 1024
+  mask_block_size: 128
+  attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
+  n_kv_sink_tokens: 0
+  model_type: "dense"
+  action_decoder:
+    embed_dim: *transformer_dim
+  rdt:
+    hidden_size: *transformer_dim
+    depth: 4
+    num_heads: 16
+    num_kv_heads: 16
+    norm_eps: 1.0e-5
+    multiple_of: 256
+    ffn_dim_multiplier: null
+    use_flash_attn: true
+    num_register_tokens: 4
+
+stage3_finetune:
+  optim:
+    learning_rate: 1.0e-4
+    weight_decay: 1.0e-4
+    beta_1: 0.9
+    beta_2: 0.999
+
+  validation_step_interval: 500
+  n_validation_steps: 200
+  save_every_n_steps: 200
+  n_training_steps: 1000
+  accumulate_grad_batches: 1
+
+  training_dataset:
+    batch_size: 1
+    shuffle: true
+    dataset_path: "/mnt/nas/datasets5/robotwin_lerobot"
+    single_task: "adjust_bottle"
+    empty_emb_path: /abs/path/to/empty_emb.pt
+    obs_cam_keys: ["cam_high"]
+    norm_stat:
+      q01: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      q99: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    image_height: *frame_height
+    image_width: *frame_width
+    image_frame_stride: 1
+    used_action_channel_ids: [0, 1, 2, 3, 4, 5, 6, 28, 7, 8, 9, 10, 11, 12, 13, 29]
+    action_dim: 30
+    robot_action_dim: 30
+    cfg_prob: 0.1
+    dataset_init_worker: 4
+    dataset_mp_start_method: "spawn"
+    dataset_worker_num_workers_per_gpu: 0
+    dataset_worker_prefetch_factor: 1
+    warn_on_starvation: false
+    rand_augmentation:
+      fraction_augmented: 1.0
+      augmentations:
+        - spatial_transform
+        - color
+        - planckian
+        - iso_noise
+        - translation
+        - random_blur
+        - sharpness
+
+  validation_datasets: []
+
+wandb:
+  enabled: false
+  project: "policy_model"
+  exp_name: "delete-me-lerobot-rdt"
