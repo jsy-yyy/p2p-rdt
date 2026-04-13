@@ -9,6 +9,7 @@ dependencies = [
     "boto3>=1.35.80",
     "flask-cors>=5.0.0",
     "flask>=3.1.0",
+    "msgpack>=1.1.0",
     "torch; sys_platform != 'darwin' and platform_machine != 'aarch64'",
     "torchvision; sys_platform != 'darwin' and platform_machine != 'aarch64'",
     "torchcodec>=0.6.0; sys_platform == 'linux'",
@@ -59,6 +60,7 @@ dependencies = [
     "sentence-transformers >= 2.6.0",
     "accelerate",
     "deepgram-sdk",
+    "websockets>=15.0.1",
 ]
 
 [project.optional-dependencies]
@@ -76,8 +78,6 @@ simulator = [
 [tool.uv]
 environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "sys_platform == 'win32' and platform_machine == 'x86_64'",
-    "sys_platform == 'darwin'",
 ]
 
 [tool.uv.sources]

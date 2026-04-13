@@ -56,7 +56,7 @@ class DatasetConfig(ConfigBase):
     action_dim: Optional[int] = None
     dataset_init_worker: int = 8
     single_task: Optional[str] = None
-    multi_view_image_mode: Literal["vertical", "frame", "first"] = "vertical"
+    multi_view_image_mode: Literal["vertical", "frame", "first", "token_concat"] = "vertical"
     text_embedding_shape: List[int] = pydantic.Field(default_factory=lambda: [1, 1])
     robot_action_dim: Optional[int] = None
 
@@ -104,13 +104,6 @@ class SparseMoEConfig(ConfigBase):
     rz_loss_weight: float = 0.001
 
 
-class ActionDecoderConfig(ConfigBase):
-    embed_dim: int = 256
-    n_q_head: int = 8
-    n_kv_head: int = 8
-    n_transformer_layers: int = 3
-
-
 class RDTConfig(ConfigBase):
     hidden_size: int = 256
     depth: int = 4
@@ -121,6 +114,15 @@ class RDTConfig(ConfigBase):
     ffn_dim_multiplier: Optional[float] = None
     use_flash_attn: bool = True
     num_register_tokens: int = 4
+    use_state_condition: bool = True
+    use_image_condition: bool = False
+    num_train_timesteps: int = 1000
+    num_inference_steps: int = 100
+    flow_match_shift: float = 3.0
+    sigma_max: float = 1.0
+    sigma_min: float = 0.003 / 1.002
+    extra_one_step: bool = True
+    action_condition_noise_std: float = 0.0
 
 
 class TransformerModelConfig(ConfigBase):
@@ -131,7 +133,6 @@ class TransformerModelConfig(ConfigBase):
     n_thinking_tokens: int = 1
     model_type: Literal["dense", "sparse_moe"] = "dense"
     sparse_moe: SparseMoEConfig = SparseMoEConfig()
-    action_decoder: ActionDecoderConfig = ActionDecoderConfig()
 
 
 class PolicyModelConfig(TransformerModelConfig):
@@ -223,6 +224,7 @@ class Stage3FineTuneConfig(PolicyTrainingConfig):
 class SharedConfig(ConfigBase):
     # Note, this will be overridden by the command line (it should never be set in a config anyway).
     fast_dev_run: bool = False
+    enable_torch_compile: bool = True
     frame_height: int = 192
     frame_width: int = 192
     output_path: str = pydantic.Field(default="tmp")

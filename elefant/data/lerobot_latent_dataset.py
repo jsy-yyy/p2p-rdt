@@ -1,7 +1,5 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.datasets.utils import get_episode_data_index
-from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+import json
 import numpy as np
 from pathlib import Path
 from collections.abc import Callable
@@ -13,8 +11,8 @@ import torch
 from einops import rearrange
 from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
-from lerobot.constants import HF_LEROBOT_HOME
 import torch.nn.functional as F
+import pyarrow.parquet as pq
 
 import logging as logger
 from elefant.data.action_label_video_proto_dataset import ActionLabelVideoDatasetItem
@@ -91,6 +89,16 @@ def infer_text_embedding_shape_from_dataset(config):
         dataset_path,
     )
     return None
+
+
+def _load_jsonl_records(path: Path) -> list[dict]:
+    records = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    return records
 
 
 def recursive_find_file(directory, filename='info.json'):
@@ -187,39 +195,6 @@ def _resolve_inverse_used_action_channel_ids(config) -> list[int]:
     raise ValueError('Config must provide either used_action_channel_ids or inverse_used_action_channel_ids.')
 
 
-def _expand_norm_stat(stat_values, inverse_ids, default_value: float, stat_name: str) -> np.ndarray:
-    stat_array = np.asarray(stat_values, dtype='float')
-    if stat_array.ndim != 1:
-        raise ValueError(f'{stat_name} must be 1D, got shape {stat_array.shape}.')
-
-    action_dim = len(inverse_ids)
-    used_action_dim = max(inverse_ids) if inverse_ids else 0
-
-    if stat_array.size == action_dim:
-        return stat_array[None]
-
-    if used_action_dim > 0 and stat_array.size != used_action_dim:
-        if stat_array.size > 0 and used_action_dim % stat_array.size == 0:
-            repeat_factor = used_action_dim // stat_array.size
-            logger.warning(
-                'Expanding %s from %s dims to %s dims by repeating values %s times.',
-                stat_name,
-                stat_array.size,
-                used_action_dim,
-                repeat_factor,
-            )
-            stat_array = np.tile(stat_array, repeat_factor)
-        else:
-            raise ValueError(
-                f'{stat_name} must have length {action_dim} or {used_action_dim}, got {stat_array.size}.'
-            )
-
-    expanded = np.full(action_dim, default_value, dtype='float')
-    for output_idx, input_idx in enumerate(inverse_ids):
-        if input_idx < stat_array.size:
-            expanded[output_idx] = stat_array[input_idx]
-    return expanded[None]
-
 class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -260,14 +235,14 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
         local_idx = idx - self.acc_dset_num[self.item_id_to_dataset_id[idx]]
         return cur_dset[local_idx]
 
-class LatentLeRobotDataset(LeRobotDataset):
+class LatentLeRobotDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         repo_id,
         config=None,
     ):
-        self.repo_id = repo_id
-        self.root = HF_LEROBOT_HOME / repo_id
+        self.repo_id = str(repo_id)
+        self.root = Path(repo_id)
         self.image_transforms = None
         self.delta_timestamps = None
         self.episodes = None
@@ -279,26 +254,16 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.episodes_since_last_encoding = 0
         self.image_writer = None
         self.episode_buffer = None
-        self.root.mkdir(exist_ok=True, parents=True)
-        self.meta = LeRobotDatasetMetadata(
-            self.repo_id, self.root, self.revision, force_cache_sync=False
-        )
-        if self.episodes is not None and self.meta._version >= packaging.version.parse("v2.1"):
-            episodes_stats = [self.meta.episodes_stats[ep_idx] for ep_idx in self.episodes]
-            self.stats = aggregate_stats(episodes_stats)
-        
-        try:
-            assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
-            self.hf_dataset = self.load_hf_dataset()
-        except (AssertionError, FileNotFoundError, NotADirectoryError):
-            self.revision = get_safe_version(self.repo_id, self.revision)
-            self.download_episodes(download_videos)
-            self.hf_dataset = self.load_hf_dataset()
-        # self.hf_dataset = self.load_hf_dataset()
-        self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
-        
-        self.latent_path = Path(repo_id) / 'latents'
-        self.image_path = Path(repo_id) / 'videos'
+        if not self.root.exists():
+            raise FileNotFoundError(f'LeRobot repo path does not exist: {self.root}')
+
+        self.meta_root = self.root / 'meta'
+        self.meta_info = json.loads((self.meta_root / 'info.json').read_text())
+        self.meta_episodes = _load_jsonl_records(self.meta_root / 'episodes.jsonl')
+        self.episode_chunk_by_index = self._build_episode_chunk_index()
+
+        self.latent_path = self.root / 'latents'
+        self.image_path = self.root / 'videos'
         empty_emb_path = getattr(config, 'empty_emb_path', '')
         if empty_emb_path and os.path.exists(empty_emb_path):
             self.empty_emb = torch.load(empty_emb_path, weights_only=False)
@@ -311,6 +276,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.config = config
         self.cfg_prob = config.cfg_prob
         self.used_video_keys = _normalize_obs_cam_keys(config.obs_cam_keys)
+        self.used_action_channel_ids = list(getattr(config, 'used_action_channel_ids', []))
         self._empty_emb_shape_warning_emitted = False
         logger.info('Using observation keys %s for repo %s', self.used_video_keys, repo_id)
         self.image_height, self.image_width = config.image_height, config.image_width
@@ -320,27 +286,36 @@ class LatentLeRobotDataset(LeRobotDataset):
             raise ValueError(
                 f'inverse_used_action_channel_ids length {len(self.inverse_used_action_channel_ids)} does not match robot_action_dim {self.robot_action_dim}.'
             )
-        self.q01 = _expand_norm_stat(
-            config.norm_stat['q01'],
-            self.inverse_used_action_channel_ids,
-            default_value=0.0,
-            stat_name='norm_stat.q01',
-        )
-        self.q99 = _expand_norm_stat(
-            config.norm_stat['q99'],
-            self.inverse_used_action_channel_ids,
-            default_value=1.0,
-            stat_name='norm_stat.q99',
-        )
-        self._hf_action_view = self.hf_dataset.with_format(
-            columns=['action'],
-            output_all_columns=False,
-        )
+        self.q01 = np.array(config.norm_stat['q01'], dtype='float')[None]
+        self.q99 = np.array(config.norm_stat['q99'], dtype='float')[None]
         self.parse_meta()
+
+    def _build_episode_chunk_index(self) -> dict[int, int]:
+        episode_chunk_by_index = {}
+        data_root = self.root / 'data'
+        for parquet_path in data_root.glob('chunk-*/episode_*.parquet'):
+            chunk_name = parquet_path.parent.name
+            episode_name = parquet_path.stem
+            try:
+                chunk_index = int(chunk_name.split('-')[-1])
+                episode_index = int(episode_name.split('_')[-1])
+            except ValueError:
+                continue
+            episode_chunk_by_index[episode_index] = chunk_index
+        return episode_chunk_by_index
+
+    def _get_episode_chunk(self, episode_index: int) -> int:
+        if episode_index not in self.episode_chunk_by_index:
+            raise KeyError(f'Missing chunk index for episode {episode_index} in {self.root}')
+        return self.episode_chunk_by_index[episode_index]
+
+    def _get_episode_action_path(self, episode_index: int) -> Path:
+        episode_chunk = self._get_episode_chunk(episode_index)
+        return self.root / 'data' / f'chunk-{episode_chunk:03d}' / f'episode_{episode_index:06d}.parquet'
 
     def parse_meta(self):
         out = []
-        for key, value in self.meta.episodes.items():
+        for value in self.meta_episodes:
             episode_index = value["episode_index"]
             tasks = value["tasks"]
             action_config = value["action_config"]
@@ -362,7 +337,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         self.new_metas = out
 
     def _check_meta(self, start_frame, end_frame, episode_index):
-        episode_chunk = self.meta.get_episode_chunk(episode_index)
+        episode_chunk = self._get_episode_chunk(episode_index)
         latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
         for key in self.used_video_keys:
             cur_path = latent_path / key
@@ -373,18 +348,13 @@ class LatentLeRobotDataset(LeRobotDataset):
                 return False
         return True
 
-    def _get_global_idx(self, episode_index: int, local_index: int):
-        ep_start = self.episode_data_index["from"][episode_index]
-        return local_index + ep_start
-
-    def _get_range_hf_data(self, start_frame, end_frame):
-        batch = self._hf_action_view[start_frame:end_frame]
-        actions = batch['action']
-        if isinstance(actions, torch.Tensor):
-            action_tensor = actions
-        else:
-            action_tensor = torch.as_tensor(np.asarray(actions))
-        return {'action': action_tensor}
+    def _get_range_hf_data(self, start_frame, end_frame, episode_index):
+        action_path = self._get_episode_action_path(episode_index)
+        action_table = pq.read_table(action_path, columns=['action']).slice(
+            start_frame, end_frame - start_frame
+        )
+        action_values = np.asarray(action_table.column('action').to_pylist(), dtype=np.float32)
+        return {'action': torch.from_numpy(action_values)}
 
     def _flatten_latent_dict(self, latent_dict):
         out = {}
@@ -395,7 +365,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         return out
 
     def _get_range_latent_data(self, start_frame, end_frame, episode_index):
-        episode_chunk = self.meta.get_episode_chunk(episode_index)
+        episode_chunk = self._get_episode_chunk(episode_index)
         latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
         out = {}
         for key in self.used_video_keys:
@@ -410,7 +380,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         return self._flatten_latent_dict(out)
 
     def _get_range_image_data(self, start_frame, end_frame, episode_index):
-        episode_chunk = self.meta.get_episode_chunk(episode_index)
+        episode_chunk = self._get_episode_chunk(episode_index)
         image_path = Path(self.image_path) / f"chunk-{episode_chunk:03d}"
         latent_path = Path(self.latent_path) / f"chunk-{episode_chunk:03d}"
         out = {}
@@ -501,8 +471,10 @@ class LatentLeRobotDataset(LeRobotDataset):
             return rearrange(torch.stack(image_lst, dim=1), 'f v c h w -> (f v) c h w')
         if mode == 'first':
             return image_lst[0]
+        if mode == 'token_concat':
+            return torch.stack(image_lst, dim=1)
         raise ValueError(
-            f"Unsupported multi_view_image_mode `{mode}`. Expected one of ['vertical', 'frame', 'first']."
+            f"Unsupported multi_view_image_mode `{mode}`. Expected one of ['vertical', 'frame', 'first', 'token_concat']."
         )
 
     def _align_actions_with_multi_view_mode(self, actions, actions_mask):
@@ -604,8 +576,11 @@ class LatentLeRobotDataset(LeRobotDataset):
     def _flatten_action_annotations(self, actions: torch.Tensor) -> torch.Tensor:
         return rearrange(actions, "c f n one -> f (c n one)").float()
 
+    def _flatten_action_mask(self, actions_mask: torch.Tensor) -> torch.Tensor:
+        return rearrange(actions_mask, "c f n one -> f (c n one)").bool()
+
     def _frame_mask_from_actions(self, actions_mask: torch.Tensor) -> torch.Tensor:
-        return rearrange(actions_mask, "c f n one -> f (c n one)").any(dim=1)
+        return self._flatten_action_mask(actions_mask).any(dim=1)
 
     def _format_text_embeddings(
         self, text_embeddings: torch.Tensor, num_frames: int
@@ -679,6 +654,76 @@ class LatentLeRobotDataset(LeRobotDataset):
 
         return torch.cat([tensor, pad], dim=0)
 
+    def _normalize_quaternion_np(self, quat: np.ndarray) -> np.ndarray:
+        quat = np.asarray(quat, dtype=np.float32).reshape(4)
+        norm = np.linalg.norm(quat)
+        if norm < 1e-8:
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        return quat / norm
+
+    def _rebase_compact_action_sequence(
+        self,
+        compact_actions: np.ndarray,
+        reference_action: np.ndarray,
+    ) -> np.ndarray:
+        compact_actions = np.asarray(compact_actions, dtype=np.float32)
+        reference_action = np.asarray(reference_action, dtype=np.float32).reshape(16)
+        rebased = compact_actions.copy()
+
+        left_reference_rot = R.from_quat(
+            self._normalize_quaternion_np(reference_action[3:7])[None]
+        )
+        right_reference_rot = R.from_quat(
+            self._normalize_quaternion_np(reference_action[11:15])[None]
+        )
+        for idx, compact_action in enumerate(compact_actions):
+            left_rot = R.from_quat(self._normalize_quaternion_np(compact_action[3:7])[None])
+            right_rot = R.from_quat(
+                self._normalize_quaternion_np(compact_action[11:15])[None]
+            )
+            rebased[idx, :3] = compact_action[:3] - reference_action[:3]
+            rebased[idx, 3:7] = (
+                left_reference_rot.inv() * left_rot
+            ).as_quat().reshape(-1)
+            rebased[idx, 7] = compact_action[7]
+            rebased[idx, 8:11] = compact_action[8:11] - reference_action[8:11]
+            rebased[idx, 11:15] = (
+                right_reference_rot.inv() * right_rot
+            ).as_quat().reshape(-1)
+            rebased[idx, 15] = compact_action[15]
+        return rebased
+
+    def _rebase_item_actions_to_slice_start(
+        self, item: ActionLabelVideoDatasetItem
+    ) -> ActionLabelVideoDatasetItem:
+        if not self.used_action_channel_ids:
+            return item
+
+        valid_mask = item.user_action_mask.bool()
+        if item.valid_frame_mask is not None:
+            valid_mask = valid_mask & item.valid_frame_mask.bool()
+        valid_indices = torch.nonzero(valid_mask, as_tuple=False).flatten()
+        if valid_indices.numel() == 0:
+            return item
+
+        first_valid_idx = int(valid_indices[0].item())
+        action_annotations = item.action_annotations.detach().cpu().numpy().astype(np.float32, copy=True)
+        used_ids = np.asarray(self.used_action_channel_ids, dtype=np.int64)
+        q01 = self.q01.reshape(-1)[used_ids].astype(np.float32)
+        q99 = self.q99.reshape(-1)[used_ids].astype(np.float32)
+        scale = q99 - q01 + 1e-6
+
+        compact_actions = ((action_annotations[:, used_ids] + 1.0) * 0.5) * scale + q01
+        rebased_compact_actions = compact_actions.copy()
+        rebased_compact_actions[first_valid_idx:] = self._rebase_compact_action_sequence(
+            compact_actions[first_valid_idx:],
+            compact_actions[first_valid_idx],
+        )
+        action_annotations[:, used_ids] = ((rebased_compact_actions - q01) / scale) * 2.0 - 1.0
+        return item._replace(
+            action_annotations=torch.from_numpy(action_annotations).float()
+        )
+
     def _ensure_fixed_sequence_length(
         self, item: ActionLabelVideoDatasetItem
     ) -> ActionLabelVideoDatasetItem:
@@ -699,9 +744,10 @@ class LatentLeRobotDataset(LeRobotDataset):
             text_embeddings=item.text_embeddings[time_slice].contiguous(),
             system_action_mask=item.system_action_mask[time_slice].contiguous(),
             valid_frame_mask=valid_frame_mask[time_slice].contiguous(),
+            action_mask=item.action_mask[time_slice].contiguous(),
         )
 
-        return ActionLabelVideoDatasetItem(
+        fixed_item = ActionLabelVideoDatasetItem(
             frames=self._pad_time_dim(
                 sliced_item.frames, target_seq_len, pad_mode="repeat_last"
             ),
@@ -725,7 +771,11 @@ class LatentLeRobotDataset(LeRobotDataset):
             valid_frame_mask=self._pad_time_dim(
                 sliced_item.valid_frame_mask, target_seq_len, pad_mode="zeros"
             ),
+            action_mask=self._pad_time_dim(
+                sliced_item.action_mask, target_seq_len, pad_mode="zeros"
+            ),
         )
+        return self._rebase_item_actions_to_slice_start(fixed_item)
 
     def _action_post_process(self, local_start_frame, local_end_frame, image_frame_ids, action):
         act_shift = int(image_frame_ids[0] - local_start_frame)
@@ -783,10 +833,8 @@ class LatentLeRobotDataset(LeRobotDataset):
         ori_data_dict = self._get_range_image_data(start_frame, end_frame, episode_index)
 
         image_frame_ids = ori_data_dict[f"{self.used_video_keys[0]}.frame_ids"]
-        start_frame = self._get_global_idx(episode_index, start_frame)
-        end_frame = self._get_global_idx(episode_index, end_frame)
 
-        hf_data_frames = self._get_range_hf_data(start_frame, end_frame)
+        hf_data_frames = self._get_range_hf_data(start_frame, end_frame, episode_index)
         ori_data_dict.update(hf_data_frames)
         out_dict = self._cat_video_images(ori_data_dict)
 
@@ -804,6 +852,7 @@ class LatentLeRobotDataset(LeRobotDataset):
         frames = out_dict["frames"]
         num_frames = frames.shape[0]
         action_annotations = self._flatten_action_annotations(actions)
+        action_mask = self._flatten_action_mask(actions_mask)
         user_action_mask = self._frame_mask_from_actions(actions_mask)
 
         assert num_frames == action_annotations.shape[0], (
@@ -820,6 +869,7 @@ class LatentLeRobotDataset(LeRobotDataset):
             ),
             system_action_mask=torch.zeros(num_frames, dtype=torch.bool),
             valid_frame_mask=torch.ones(num_frames, dtype=torch.bool),
+            action_mask=action_mask,
         )
         return self._ensure_fixed_sequence_length(item)
 

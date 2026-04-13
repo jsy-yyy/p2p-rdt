@@ -28,7 +28,7 @@ class ActionLabelVideoProtoDatasetConfig(VideoProtoDatasetConfig):
 
 
 class ActionLabelVideoDatasetItem(NamedTuple):
-    frames: torch.Tensor  # (T, H, W, C)
+    frames: torch.Tensor  # (T, C, H, W) or (T, V, C, H, W) depending on multi_view_image_mode
     action_annotations: torch.Tensor  # (T, action_seq_len)
     env_subenv_encoding: torch.Tensor  # (T)
     # A binary mask indicating whether the action was by the user (if mask is 0 then it is a system action or unknown)
@@ -36,6 +36,7 @@ class ActionLabelVideoDatasetItem(NamedTuple):
     text_embeddings: torch.Tensor  # (T, n_text_tokens, text_embedding_dim)
     system_action_mask: torch.Tensor  # (T)
     valid_frame_mask: torch.Tensor | None = None
+    action_mask: torch.Tensor | None = None  # (T, action_seq_len) or empty trailing dim when unavailable
 
 
 class ActionLabelAnnotationParser(ProtoParser):
@@ -215,6 +216,7 @@ class ActionLabelAnnotationParser(ProtoParser):
                 system_action_mask=system_action_mask,
                 valid_frame_mask=valid_frame_mask,
                 text_embeddings=text_embeddings,
+                action_mask=torch.zeros((n_frames, 0), dtype=torch.bool),
             )
         else:
             logging.warning("Frame annotations are None - this should not happen")

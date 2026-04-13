@@ -41,12 +41,19 @@ class DummyDataset(torch.utils.data.IterableDataset):
                 (self.cfg.T, self.action_dim), dtype=torch.long
             )
             user_action_mask = torch.ones((self.cfg.T), dtype=torch.bool)
-            env_subenv_encoding = torch.zeros((1,), dtype=torch.long)
+            system_action_mask = torch.zeros((self.cfg.T), dtype=torch.bool)
+            env_subenv_encoding = torch.zeros((self.cfg.T,), dtype=torch.long)
+            text_embeddings = torch.zeros((self.cfg.T, 1, 1), dtype=torch.float32)
+            action_mask = torch.zeros((self.cfg.T, 0), dtype=torch.bool)
             yield ActionLabelVideoDatasetItem(
                 frames=frames,
                 action_annotations=action_annotations,
                 env_subenv_encoding=env_subenv_encoding,
                 user_action_mask=user_action_mask,
+                text_embeddings=text_embeddings,
+                system_action_mask=system_action_mask,
+                valid_frame_mask=torch.ones((self.cfg.T,), dtype=torch.bool),
+                action_mask=action_mask,
             )
 
     def to_dataloader(self, batch_size: int, prefetch_factor: int = 2):

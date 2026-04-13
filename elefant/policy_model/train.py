@@ -1,11 +1,29 @@
 import argparse
 from elefant.policy_model.config import LightningPolicyConfig
 from elefant.config import load_config
-from elefant.policy_model.stage3_finetune import train_stage3_finetune
+from elefant.policy_model.stage3_finetune import train_stage3_finetune, _select_training_gpus
 import logging
+import os
+import sys
 import torch
 import elefant.torch
 from elefant.torch import configure_logging
+
+
+def _maybe_reexec_with_filtered_gpus():
+    if os.environ.get("ELEFANT_STAGE3_GPU_FILTERED"):
+        return
+    accelerator, _devices = _select_training_gpus()
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if accelerator != "gpu" or not visible:
+        return
+    env = os.environ.copy()
+    env["ELEFANT_STAGE3_GPU_FILTERED"] = "1"
+    logging.warning(
+        "Re-launching training with CUDA_VISIBLE_DEVICES=%s so Lightning starts with the filtered GPU set.",
+        visible,
+    )
+    os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
 
 
 def lightning_main():
@@ -22,6 +40,8 @@ def lightning_main():
         help="Checkpoint file or directory to resume stage3 training from.",
     )
     args = parser.parse_args()
+
+    _maybe_reexec_with_filtered_gpus()
 
     config = load_config(args.config, LightningPolicyConfig)
     config.shared.fast_dev_run = args.fast_dev_run

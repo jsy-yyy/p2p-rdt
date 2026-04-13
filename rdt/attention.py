@@ -193,27 +193,41 @@ class CrossAttention(nn.Module):
         ck = ck.transpose(1, 2)  # (bs, n_heads, c_len, head_size)
         cv = cv.transpose(1, 2)  # (bs, n_heads, c_len, head_size)
 
-        # Prepare attn mask (bs, c_len) to mask the condition
+        # Prepare attn mask (bs, c_len) to mask the condition.
+        # Some training samples can have all conditioning steps masked out after
+        # padding/slicing. A naive softmax over all-masked rows produces NaNs and
+        # can corrupt the entire predicted action chunk, so we route masked
+        # cross-attention through a numerically stable float32 path that returns
+        # zero output for empty rows.
+        mask_bool = None
         if mask is not None:
-            mask = mask.reshape(bs, 1, 1, -1)
-            mask = mask.expand(-1, -1, seq_len, -1)
+            mask_bool = mask.reshape(bs, 1, 1, -1)
+            mask_bool = mask_bool.expand(-1, -1, seq_len, -1)
 
-        if self.use_flash_attn:
+        if self.use_flash_attn and mask_bool is None:
             output = F.scaled_dot_product_attention(
                 query=xq,
                 key=ck,
                 value=cv,
-                attn_mask=mask,
+                attn_mask=None,
                 dropout_p=0.0,
                 is_causal=False,
                 scale=self.attn_scale,
             )
         else:
-            scores = torch.matmul(xq, ck.transpose(2, 3)) * self.attn_scale
-            if mask is not None:
-                attn = attn.masked_fill_(mask.logical_not(), float('-inf'))
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            output = torch.matmul(scores, cv)   # (bs, n_heads, seq_len, head_size)
+            scores = torch.matmul(xq.float(), ck.float().transpose(2, 3)) * self.attn_scale
+            if mask_bool is not None:
+                scores = scores.masked_fill(~mask_bool, -1e9)
+            attn = F.softmax(scores, dim=-1)
+            if mask_bool is not None:
+                attn = attn * mask_bool.to(attn.dtype)
+                denom = attn.sum(dim=-1, keepdim=True)
+                attn = torch.where(
+                    denom > 0,
+                    attn / denom.clamp_min(1e-12),
+                    torch.zeros_like(attn),
+                )
+            output = torch.matmul(attn, cv.float()).to(xq.dtype)   # (bs, n_heads, seq_len, head_size)
 
         output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
         return self.wo(output)

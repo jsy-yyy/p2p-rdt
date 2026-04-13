@@ -420,16 +420,26 @@ class ImageAugmentationPipeline:
 class BatchRandAugment:
     """
     Wrapper around RandAugmentKornia to apply the same augmentations to a batch of videos.
-    Assumes the input shape is (B, T, C, H, W).
+    Supports both (B, T, C, H, W) and (B, T, V, C, H, W) inputs.
     """
 
     def __init__(self, augmentations: List[str]) -> None:
         self.rand_augment = ImageAugmentationPipeline(augmentations=augmentations)
 
     def __call__(self, frames):
-        # Set default device for tensor creation
-        B, T, C, H, W = frames.shape
-        frames = frames.reshape(B * T, C, H, W).float().div_(255.0)
-        frames = self.rand_augment(frames)
-        frames = frames.mul_(255.0).reshape(B, T, C, H, W).byte()
-        return frames
+        # Set default device for tensor creation.
+        if frames.ndim == 5:
+            B, T, C, H, W = frames.shape
+            frames = frames.reshape(B * T, C, H, W).float().div_(255.0)
+            frames = self.rand_augment(frames)
+            return frames.mul_(255.0).reshape(B, T, C, H, W).byte()
+
+        if frames.ndim == 6:
+            B, T, V, C, H, W = frames.shape
+            frames = frames.reshape(B * T * V, C, H, W).float().div_(255.0)
+            frames = self.rand_augment(frames)
+            return frames.mul_(255.0).reshape(B, T, V, C, H, W).byte()
+
+        raise ValueError(
+            f"BatchRandAugment expects 5D or 6D frames, got shape {tuple(frames.shape)}."
+        )

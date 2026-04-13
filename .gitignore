@@ -14,3 +14,5 @@ data_folder_validation/
 train_out
 *.md
 *.log
+eval_result/
+.venv

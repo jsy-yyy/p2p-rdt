@@ -43,6 +43,9 @@ def move_action_label_video_dataset_item_to_device(
     moved_system_action_mask = batch.system_action_mask.to(device)
     moved_valid_frame_mask = batch.valid_frame_mask.to(device)
     moved_text_embeddings = batch.text_embeddings.to(device)
+    moved_action_mask = None
+    if batch.action_mask is not None:
+        moved_action_mask = batch.action_mask.to(device)
     return ActionLabelVideoDatasetItem(
         frames=moved_frames,
         action_annotations=moved_action_annotations,
@@ -51,6 +54,7 @@ def move_action_label_video_dataset_item_to_device(
         system_action_mask=moved_system_action_mask,
         valid_frame_mask=moved_valid_frame_mask,
         text_embeddings=moved_text_embeddings,
+        action_mask=moved_action_mask,
     )
 
 

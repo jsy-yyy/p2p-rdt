@@ -302,8 +302,12 @@ class UniversalAutoregressiveActionMapping:
         self.config = config
         self._setup_reverse_map()
 
-        self._mouse_delta_x_edges = torch.tensor(MOUSE_X_BIN_EDGES, dtype=torch.float32)
-        self._mouse_delta_y_edges = torch.tensor(MOUSE_Y_BIN_EDGES, dtype=torch.float32)
+        self._mouse_delta_x_edges = torch.tensor(
+            MOUSE_X_BIN_EDGES, dtype=torch.float32, device='cpu'
+        )
+        self._mouse_delta_y_edges = torch.tensor(
+            MOUSE_Y_BIN_EDGES, dtype=torch.float32, device='cpu'
+        )
 
     def make_empty_action(self, T: int) -> StructuredAction:
         device = self._mouse_delta_x_edges.device

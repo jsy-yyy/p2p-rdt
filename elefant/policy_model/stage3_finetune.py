@@ -1,5 +1,9 @@
+import contextlib
 import logging
 import json
+import shutil
+import subprocess
+import sys
 
 import lightning as pl
 import torch
@@ -20,10 +24,6 @@ from elefant.data import (
 )
 from elefant.text_tokenizer.config import TextTokenizerConfig
 from elefant.data.rand_augment import BatchRandAugment
-from elefant.data.lerobot_latent_dataset import (
-    MultiLatentLeRobotDataset,
-    infer_text_embedding_shape_from_dataset,
-)
 from elefant.policy_model.config import LightningPolicyConfig
 from elefant.policy_model.model_free import ModelFreePolicy
 from lightning.pytorch.callbacks import ModelCheckpoint
@@ -42,8 +42,27 @@ from elefant.torch import count_model_parameters
 from elefant.data.action_mapping import UniversalAutoregressiveActionMapping
 from elefant.metrics import LossMetric
 from elefant.policy_model.config import DatasetConfig, ValidationDatasetConfig
+from elefant.policy_model.flow_matching import FlowMatchScheduler, sample_timestep_id
 from rdt.model import RDT
 from lightning.fabric.utilities.cloud_io import get_filesystem
+
+
+def _load_lerobot_dataset_support():
+    try:
+        from elefant.data.lerobot_latent_dataset import (
+            MultiLatentLeRobotDataset,
+            infer_text_embedding_shape_from_dataset,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name and (exc.name == 'lerobot' or exc.name.startswith('lerobot.')):
+            raise ModuleNotFoundError(
+                'LeRobot dataset support requires the `lerobot` package. '
+                'Inference paths like the RobotWin websocket server can run '
+                'without it, but stage3 dataset loading and training cannot.'
+            ) from exc
+        raise
+
+    return MultiLatentLeRobotDataset, infer_text_embedding_shape_from_dataset
 
 
 def _metric_to_float(metric_value: torch.Tensor | float) -> float:
@@ -61,28 +80,77 @@ def _validate_resume_checkpoint_compatibility(
         logging.warning('Checkpoint %s has no state_dict; skipping action-dimension compatibility check.', checkpoint_path)
         return
 
+    legacy_rdt_keys = (
+        'policy_summary_to_rdt_action_tokens_proj.',
+        'policy_summary_to_rdt_state_proj.',
+        'text_condition_to_rdt_proj.',
+    )
+    if any(any(key.startswith(prefix) for prefix in legacy_rdt_keys) for key in state_dict):
+        raise ValueError(
+            'Resume checkpoint RDT conditioning mismatch: the checkpoint uses the '
+            'legacy direct-regression RDT head, but the current code expects the '
+            'StreamVGGT-style denoising RDT head.'
+        )
+    if 'rdt_action_queries' in state_dict:
+        raise ValueError(
+            'Resume checkpoint RDT x-source mismatch: learned query based RDT checkpoints '
+            'are not compatible with the current noisy-action denoising head.'
+        )
+
     expected_n_actions = config.stage3_finetune.training_dataset.get_robot_action_dim()
+    expected_seq_len = config.shared.n_seq_timesteps
+    expected_transformer_action_tokens = 1
+
     action_pos_tokens = state_dict.get('bc_transformer.action_pos_tokens')
     if action_pos_tokens is not None:
         checkpoint_n_actions = int(action_pos_tokens.shape[1])
-        if checkpoint_n_actions != expected_n_actions:
+        if checkpoint_n_actions != expected_transformer_action_tokens:
             raise ValueError(
-                'Resume checkpoint action dimension mismatch: '
-                f'checkpoint has {checkpoint_n_actions} action tokens but config expects {expected_n_actions}. '
-                'This usually means you are trying to resume a checkpoint trained with a different robot_action_dim.'
+                'Resume checkpoint action-token mismatch: '
+                f'checkpoint has {checkpoint_n_actions} transformer action tokens but config expects {expected_transformer_action_tokens}. '
+                'This usually means you are trying to resume a checkpoint trained with a different action-tokenization scheme.'
             )
 
     x_pos_emb = state_dict.get('rdt_policy_head.x_pos_emb')
     if x_pos_emb is not None:
-        expected_x_pos_tokens = expected_n_actions + config.policy_model.rdt.num_register_tokens
+        expected_x_pos_tokens = expected_seq_len + config.policy_model.rdt.num_register_tokens
         checkpoint_x_pos_tokens = int(x_pos_emb.shape[1])
         if checkpoint_x_pos_tokens != expected_x_pos_tokens:
             raise ValueError(
                 'Resume checkpoint RDT position embedding mismatch: '
                 f'checkpoint has {checkpoint_x_pos_tokens} x_pos tokens but config expects {expected_x_pos_tokens}. '
-                'This usually means you are trying to resume a checkpoint trained with a different robot_action_dim.'
+                'This usually means you are trying to resume a checkpoint trained with a different sequence length.'
             )
 
+    act_pos_emb = state_dict.get('rdt_policy_head.act_pos_emb')
+    if act_pos_emb is None:
+        raise ValueError(
+            'Resume checkpoint RDT conditioning mismatch: checkpoint is missing '
+            'rdt_policy_head.act_pos_emb required by the current action-token-conditioned RDT head.'
+        )
+    checkpoint_action_condition_tokens = int(act_pos_emb.shape[1])
+    if checkpoint_action_condition_tokens != expected_seq_len:
+        raise ValueError(
+            'Resume checkpoint RDT action-condition length mismatch: '
+            f'checkpoint has {checkpoint_action_condition_tokens} action condition tokens '
+            f'but config expects {expected_seq_len}.'
+        )
+
+    action_embedder = state_dict.get('rdt_policy_head.action_embedder.weight')
+    if action_embedder is not None and int(action_embedder.shape[1]) != expected_n_actions:
+        raise ValueError(
+            'Resume checkpoint RDT action embedder mismatch: '
+            f'checkpoint action_dim={int(action_embedder.shape[1])} but config expects {expected_n_actions}.'
+        )
+
+    checkpoint_has_image_condition = state_dict.get('rdt_policy_head.img_pos_emb') is not None
+    expected_image_condition = config.policy_model.rdt.use_image_condition
+    if checkpoint_has_image_condition != expected_image_condition:
+        raise ValueError(
+            'Resume checkpoint RDT image-conditioning mismatch: '
+            f'checkpoint image_condition={checkpoint_has_image_condition} but '
+            f'config expects image_condition={expected_image_condition}.'
+        )
 
 def _resolve_resume_checkpoint_path(config: LightningPolicyConfig) -> Optional[str]:
     checkpoint_path = config.stage3_finetune.init.stage3_model_path
@@ -141,6 +209,7 @@ def _sample_from_distribution(
 
 
 def _sync_text_embedding_shape_with_dataset(config: LightningPolicyConfig):
+    _, infer_text_embedding_shape_from_dataset = _load_lerobot_dataset_support()
     inferred = infer_text_embedding_shape_from_dataset(
         config.stage3_finetune.training_dataset
     )
@@ -202,6 +271,11 @@ class PolicyModelTrainer(ModelFreePolicy):
             config=config, stage_name=stage_name, inference_mode=inference_mode
         )
 
+        self._force_stable_rdt_training = (
+            stage_name == "stage3_finetune"
+            and "bf16" in str(self.config.shared.precision).lower()
+        )
+        self._rdt_param_dtype = self._get_rdt_param_dtype()
         self._init_action_mapping()
         self._already_frozen = False
         self._already_unfrozen = False
@@ -212,12 +286,25 @@ class PolicyModelTrainer(ModelFreePolicy):
             else 0
         )
         self.z_loss_weight = self.config.policy_model.z_loss_weight
-        if self.config.policy_model.model_type == "sparse_moe":
-            self.compile_mode = torch.compile(fullgraph=True)
+        torch_compile_enabled = bool(
+            getattr(self.config.shared, "enable_torch_compile", True)
+        )
+        if self._force_stable_rdt_training and torch_compile_enabled:
+            logging.warning(
+                "Disabling torch.compile for stage3 bf16 RDT training to avoid "
+                "non-finite action predictions during resumed multi-GPU runs."
+            )
+            torch_compile_enabled = False
+
+        if torch_compile_enabled:
+            if self.config.policy_model.model_type == "sparse_moe":
+                self.compile_mode = torch.compile(fullgraph=True)
+            else:
+                # default compilation mode is without max autotune which gets
+                # edited when initializing stage 1/3 with max-autotunes
+                self.compile_mode = torch.compile()
         else:
-            # default compilation mode is without max autotune which gets
-            # edited when initializing stage 1/3 with max-autotunes
-            self.compile_mode = torch.compile()
+            self.compile_mode = lambda fn: fn
         self.rz_loss_weight = (
             self.config.policy_model.sparse_moe.rz_loss_weight
             if self.config.policy_model.model_type == "sparse_moe"
@@ -231,6 +318,13 @@ class PolicyModelTrainer(ModelFreePolicy):
 
         self._init_metrics()
         self.top_p = config.policy_model.top_p
+        self._init_rdt_schedulers()
+        if self._force_stable_rdt_training and self._rdt_param_dtype == torch.float32:
+            logging.warning(
+                "Keeping stage3 RDT trainable weights in float32 and running "
+                "its denoising path without autocast for better bf16 resume "
+                "stability."
+            )
 
     def setup(self, stage):
         self._init_rand_augment()
@@ -287,11 +381,51 @@ class PolicyModelTrainer(ModelFreePolicy):
 
         self._validation_metrics = {}
 
+    def _init_rdt_schedulers(self):
+        rdt_cfg = self.config.policy_model.rdt
+        scheduler_kwargs = dict(
+            num_inference_steps=rdt_cfg.num_inference_steps,
+            num_train_timesteps=rdt_cfg.num_train_timesteps,
+            shift=rdt_cfg.flow_match_shift,
+            sigma_max=rdt_cfg.sigma_max,
+            sigma_min=rdt_cfg.sigma_min,
+            extra_one_step=rdt_cfg.extra_one_step,
+        )
+        self.rdt_train_scheduler = FlowMatchScheduler(**scheduler_kwargs)
+        self.rdt_train_scheduler.set_timesteps(
+            rdt_cfg.num_train_timesteps,
+            training=True,
+        )
+        self.rdt_inference_scheduler = FlowMatchScheduler(**scheduler_kwargs)
+        self.rdt_inference_scheduler.set_timesteps(rdt_cfg.num_inference_steps)
+
+    def _get_rdt_param_dtype(self) -> torch.dtype:
+        # Keep trainable RDT parameters in fp32 during training so the optimizer
+        # maintains stable master weights even when Lightning runs bf16 autocast.
+        if not self.inference_mode:
+            return torch.float32
+        precision = str(self.config.shared.precision).lower()
+        if "bf16" in precision:
+            return torch.bfloat16
+        return torch.float32
+
+    def _rdt_forward_context(self, device: torch.device):
+        if not self._force_stable_rdt_training:
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=device.type, enabled=False)
+
     def _init_action_mapping(self):
         self.n_actions = self.config.stage3_finetune.training_dataset.get_robot_action_dim()
         self.embedding_std = 0.1
-        action_embed_dim = self.config.policy_model.action_decoder.embed_dim
         self.rdt_hidden_size = self.config.policy_model.rdt.hidden_size
+        self.use_state_condition = self.config.policy_model.rdt.use_state_condition
+        self.use_image_condition = self.config.policy_model.rdt.use_image_condition
+        self.rdt_horizon = self.config.shared.n_seq_timesteps
+        self.rdt_action_condition_len = self.config.shared.n_seq_timesteps
+        self.rdt_image_condition_tokens_per_step = (
+            self.image_tokenizer.get_n_img_tokens()
+        )
+        rdt_param_dtype = self._rdt_param_dtype
 
         def _init_linear(layer: nn.Linear):
             torch.nn.init.normal_(layer.weight, mean=0.0, std=self.embedding_std)
@@ -299,40 +433,68 @@ class PolicyModelTrainer(ModelFreePolicy):
                 torch.nn.init.zeros_(layer.bias)
 
         self.robot_action_in_proj = nn.Linear(
-            1,
-            action_embed_dim,
-            dtype=torch.bfloat16,
+            self.n_actions,
+            self.config.policy_model.transformer_dim,
+            dtype=rdt_param_dtype,
         )
         _init_linear(self.robot_action_in_proj)
 
-        if action_embed_dim == self.rdt_hidden_size:
-            self.policy_action_to_rdt_proj = nn.Identity()
+        if self.config.policy_model.transformer_dim == self.rdt_hidden_size:
+            self.policy_action_condition_to_rdt_proj = nn.Identity()
         else:
-            self.policy_action_to_rdt_proj = nn.Linear(
-                action_embed_dim,
+            self.policy_action_condition_to_rdt_proj = nn.Linear(
+                self.config.policy_model.transformer_dim,
                 self.rdt_hidden_size,
-                dtype=torch.bfloat16,
+                dtype=rdt_param_dtype,
             )
-            _init_linear(self.policy_action_to_rdt_proj)
+            _init_linear(self.policy_action_condition_to_rdt_proj)
 
-        self.policy_summary_to_rdt_state_proj = nn.Linear(
-            self.config.policy_model.transformer_dim,
-            self.rdt_hidden_size,
-            dtype=torch.bfloat16,
-        )
-        _init_linear(self.policy_summary_to_rdt_state_proj)
+        if self.config.policy_model.transformer_dim == self.rdt_hidden_size:
+            self.image_condition_to_rdt_proj = nn.Identity()
+        else:
+            self.image_condition_to_rdt_proj = nn.Linear(
+                self.config.policy_model.transformer_dim,
+                self.rdt_hidden_size,
+                dtype=rdt_param_dtype,
+            )
+            _init_linear(self.image_condition_to_rdt_proj)
 
-        self.text_condition_to_rdt_proj = nn.Linear(
-            self._get_text_embedding_dim(),
-            self.rdt_hidden_size,
-            dtype=torch.bfloat16,
+        img_pos_emb_config = None
+        max_img_len = 0
+        if self.use_image_condition:
+            img_pos_emb_config = [
+                (
+                    "image",
+                    (
+                        self.config.shared.n_seq_timesteps,
+                        self.rdt_image_condition_tokens_per_step,
+                    ),
+                )
+            ]
+            max_img_len = (
+                self.config.shared.n_seq_timesteps
+                * self.rdt_image_condition_tokens_per_step
+            )
+
+        self.null_state_condition = nn.Parameter(
+            torch.zeros(1, 1, self.n_actions, dtype=rdt_param_dtype)
         )
-        _init_linear(self.text_condition_to_rdt_proj)
+        torch.nn.init.normal_(
+            self.null_state_condition, mean=0.0, std=self.embedding_std
+        )
 
         rdt_config = self.config.policy_model.rdt
+        use_flash_attn = bool(rdt_config.use_flash_attn)
+        if self._force_stable_rdt_training and use_flash_attn:
+            logging.warning(
+                "Disabling RDT flash attention for stage3 bf16 training because "
+                "this configuration has produced non-finite action predictions."
+            )
+            use_flash_attn = False
+
         self.rdt_policy_head = RDT(
-            horizon=self.n_actions,
-            output_size=1,
+            horizon=self.rdt_horizon,
+            output_size=self.n_actions,
             config={
                 "hidden_size": self.rdt_hidden_size,
                 "num_heads": rdt_config.num_heads,
@@ -341,21 +503,21 @@ class PolicyModelTrainer(ModelFreePolicy):
                 "norm_eps": rdt_config.norm_eps,
                 "multiple_of": rdt_config.multiple_of,
                 "ffn_dim_multiplier": rdt_config.ffn_dim_multiplier,
-                "use_flash_attn": rdt_config.use_flash_attn,
+                "use_flash_attn": use_flash_attn,
                 "num_register_tokens": rdt_config.num_register_tokens,
-                "action_dim": 1,
+                "action_dim": self.n_actions,
             },
             x_pos_emb_config=[
-                ("action", self.n_actions),
+                ("action", self.rdt_horizon),
                 ("register", rdt_config.num_register_tokens),
             ],
             lang_pos_emb_config=[],
             max_lang_len=0,
-            img_pos_emb_config=None,
-            max_img_len=0,
-            act_pos_emb_config=[("text", self.text_token_size)],
-            max_act_len=self.text_token_size,
-            dtype=torch.bfloat16,
+            img_pos_emb_config=img_pos_emb_config,
+            max_img_len=max_img_len,
+            act_pos_emb_config=[("action", self.rdt_action_condition_len)],
+            max_act_len=self.rdt_action_condition_len,
+            dtype=rdt_param_dtype,
         )
 
     def configure_model(self):
@@ -372,7 +534,7 @@ class PolicyModelTrainer(ModelFreePolicy):
         text_tokens_embed: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, List[KVCacheState]]:
         raise NotImplementedError(
-            "KV-cache autoregressive inference still depends on the old discrete action decoder and is not supported in the LeRobot + RDT path. Use online_full_predict() for continuous RobotAction prediction."
+            "KV-cache autoregressive inference is no longer supported. Use online_full_predict() for continuous RobotAction prediction."
         )
 
     def _prepare_text_tokens_embed_for_inference(
@@ -426,7 +588,9 @@ class PolicyModelTrainer(ModelFreePolicy):
         frames: torch.Tensor,
         actions: torch.Tensor,
         text_tokens_embed: Optional[torch.Tensor] = None,
+        compile: bool = True,
     ) -> torch.Tensor:
+        valid_step_mask = self._get_rdt_valid_step_mask(frames)
         frames = self._normalize_frames(frames)
         B, T = frames.shape[0], frames.shape[1]
         text_tokens_embed = self._prepare_text_tokens_embed_for_inference(
@@ -436,13 +600,21 @@ class PolicyModelTrainer(ModelFreePolicy):
             text_tokens_embed=text_tokens_embed,
         )
         action_embeddings_in = self.action_in_to_tokens(actions)
-        action_out_embeddings, action_out_tokens, *_ = self.transformer_forward_function(
+        (
+            _,
+            action_out_tokens,
+            image_tokens,
+            *_ ,
+        ) = self.transformer_forward_function(
             frames, action_embeddings_in, text_tokens_embed
         )
         action_preds = self.action_tokens_to_actions(
-            action_out_embeddings,
-            action_out_tokens,
-            text_tokens_embed,
+            action_out_tokens=action_out_tokens,
+            image_tokens=image_tokens,
+            action_shape_source=actions,
+            state_actions=actions,
+            valid_step_mask=valid_step_mask,
+            compile=compile,
         )
         eager_assert(action_preds.shape, (B, T, self.n_actions))
         return action_preds
@@ -457,6 +629,7 @@ class PolicyModelTrainer(ModelFreePolicy):
             frames=frames,
             actions=actions,
             text_tokens_embed=text_tokens_embed,
+            compile=False,
         )
 
     def online_full_predict(
@@ -469,22 +642,18 @@ class PolicyModelTrainer(ModelFreePolicy):
         compile: bool = True,
     ) -> torch.Tensor:
         del kv_cache_state, sampling_temperature
-
-        @(torch.compile(fullgraph=True) if compile else lambda f: f)
-        def _predict(frames, actions, text_tokens_embed):
+        with torch.inference_mode():
             return self.online_full_predict_actions(
                 frames=frames,
                 actions=actions,
                 text_tokens_embed=text_tokens_embed,
+                compile=compile,
             )
-
-        with torch.inference_mode():
-            return _predict(frames, actions, text_tokens_embed)
 
     def action_in_to_tokens(
         self, action_in: torch.Tensor, idx: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Project continuous robot actions into action tokens."""
+        """Project a full continuous robot action vector into one action token per step."""
         B, T, D = action_in.shape
         eager_assert(action_in.shape, (B, T, self.n_actions))
 
@@ -493,83 +662,264 @@ class PolicyModelTrainer(ModelFreePolicy):
         else:
             action_subset = action_in[idx]
 
+        action_proj_dtype = self.robot_action_in_proj.weight.dtype
         action_embedding = self.robot_action_in_proj(
-            action_subset.unsqueeze(-1).to(torch.bfloat16)
-        )
+            action_subset.to(action_proj_dtype)
+        ).unsqueeze(2)
         eager_assert(
             action_embedding.shape,
             (
                 B if idx is None else len(idx),
                 T,
-                self.n_actions,
-                self.config.policy_model.action_decoder.embed_dim,
+                self.transformer_n_action_tokens,
+                self.config.policy_model.transformer_dim,
             ),
         )
         return action_embedding
 
-    def action_tokens_to_actions(
+    def _get_rdt_valid_step_mask(
         self,
-        action_out_embeddings: torch.Tensor,
-        action_out_tokens: torch.Tensor,
-        text_tokens_embed: torch.Tensor,
+        frames: torch.Tensor,
+        valid_step_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        B, T, N, _ = action_out_embeddings.shape
-        eager_assert(N, self.n_actions)
+        if valid_step_mask is not None:
+            return valid_step_mask
+        inferred_mask = frames.abs().sum(dim=tuple(range(2, frames.ndim))) > 0
+        if inferred_mask.any():
+            return inferred_mask
+        return torch.ones(
+            frames.shape[0],
+            frames.shape[1],
+            dtype=torch.bool,
+            device=frames.device,
+        )
+
+    def _maybe_add_noise_to_action_condition(
+        self, action_condition: torch.Tensor
+    ) -> torch.Tensor:
+        noise_std = float(self.config.policy_model.rdt.action_condition_noise_std)
+        if not self.training or noise_std <= 0.0:
+            return action_condition
+
+        action_condition_fp32 = action_condition.float()
+        # Scale the noise by each step token RMS so one fixed std stays usable
+        # across checkpoints and training stages.
+        token_rms = action_condition_fp32.pow(2).mean(dim=-1, keepdim=True)
+        token_rms = token_rms.add(1e-6).sqrt()
+        noise = torch.randn_like(action_condition_fp32) * (token_rms * noise_std)
+        return (action_condition_fp32 + noise).to(dtype=action_condition.dtype)
+
+    def _build_rdt_conditions(
+        self,
+        action_out_tokens: torch.Tensor,
+        image_tokens: torch.Tensor,
+        state_actions: torch.Tensor,
+        valid_step_mask: torch.Tensor,
+        condition_step_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
         eager_assert(
             action_out_tokens.shape,
-            (B, T, self.config.policy_model.transformer_dim),
+            (state_actions.shape[0], self.rdt_action_condition_len, self.config.policy_model.transformer_dim),
+        )
+        eager_assert(valid_step_mask.shape, (state_actions.shape[0], self.rdt_action_condition_len))
+        if condition_step_mask is None:
+            condition_step_mask = valid_step_mask
+        else:
+            eager_assert(
+                condition_step_mask.shape,
+                (state_actions.shape[0], self.rdt_action_condition_len),
+            )
+            condition_step_mask = condition_step_mask & valid_step_mask
+
+        action_condition_dtype = getattr(
+            getattr(self.policy_action_condition_to_rdt_proj, "weight", None),
+            "dtype",
+            action_out_tokens.dtype,
+        )
+        action_condition = self.policy_action_condition_to_rdt_proj(
+            action_out_tokens.to(action_condition_dtype)
         )
         eager_assert(
-            text_tokens_embed.shape,
+            action_condition.shape,
             (
-                B,
-                T,
-                self.text_token_size,
-                self._get_text_embedding_dim(),
+                state_actions.shape[0],
+                self.rdt_action_condition_len,
+                self.rdt_hidden_size,
             ),
         )
+        action_condition = self._maybe_add_noise_to_action_condition(action_condition)
 
-        action_tokens_for_rdt = self.policy_action_to_rdt_proj(
-            action_out_embeddings.to(torch.bfloat16)
-        )
-        eager_assert(
-            action_tokens_for_rdt.shape,
-            (B, T, self.n_actions, self.rdt_hidden_size),
+        image_condition = None
+        image_condition_mask = None
+        if self.use_image_condition:
+            image_condition_dtype = getattr(
+                getattr(self.image_condition_to_rdt_proj, "weight", None),
+                "dtype",
+                image_tokens.dtype,
+            )
+            eager_assert(
+                image_tokens.shape,
+                (
+                    state_actions.shape[0],
+                    self.rdt_action_condition_len,
+                    self.rdt_image_condition_tokens_per_step,
+                    self.config.policy_model.transformer_dim,
+                ),
+            )
+            image_condition = self.image_condition_to_rdt_proj(
+                image_tokens.to(image_condition_dtype)
+            ).reshape(
+                state_actions.shape[0],
+                self.rdt_action_condition_len * self.rdt_image_condition_tokens_per_step,
+                self.rdt_hidden_size,
+            )
+            image_condition_mask = condition_step_mask.unsqueeze(-1).expand(
+                state_actions.shape[0],
+                self.rdt_action_condition_len,
+                self.rdt_image_condition_tokens_per_step,
+            ).reshape(
+                state_actions.shape[0],
+                self.rdt_action_condition_len * self.rdt_image_condition_tokens_per_step,
+            )
+
+        if self.use_state_condition:
+            # Align with StreamVGGT: state_c comes from the first clean action in the
+            # action sequence being modeled by RDT.
+            state_condition = state_actions[:, :1, :].to(self.null_state_condition.dtype)
+        else:
+            state_condition = self.null_state_condition.expand(
+                state_actions.shape[0], -1, -1
+            )
+        eager_assert(state_condition.shape, (state_actions.shape[0], 1, self.n_actions))
+        return (
+            state_condition,
+            action_condition,
+            image_condition,
+            condition_step_mask,
+            image_condition_mask,
         )
 
-        state_tokens = self.policy_summary_to_rdt_state_proj(
-            action_out_tokens.to(torch.bfloat16)
-        ).reshape(B * T, 1, self.rdt_hidden_size)
-        eager_assert(state_tokens.shape, (B * T, 1, self.rdt_hidden_size))
+    def _sample_noisy_action_sequence(
+        self,
+        clean_actions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size = clean_actions.shape[0]
+        timestep_ids = sample_timestep_id(
+            batch_size=batch_size,
+            num_train_timesteps=self.rdt_train_scheduler.num_train_timesteps,
+        ).to(clean_actions.device)
+        timesteps = self.rdt_train_scheduler.timesteps.to(clean_actions.device)[timestep_ids]
+        sigmas = self.rdt_train_scheduler.sigmas.to(clean_actions.device)[timestep_ids].view(
+            batch_size, 1, 1
+        )
+        noise = torch.randn_like(clean_actions)
+        noisy_actions = (1 - sigmas) * clean_actions + sigmas * noise
+        targets = self.rdt_train_scheduler.training_target(clean_actions, noise, timesteps)
+        weights = self.rdt_train_scheduler.training_weight(timesteps).view(batch_size, 1, 1)
+        return noisy_actions, targets, timesteps, weights
 
-        text_condition = self.text_condition_to_rdt_proj(
-            text_tokens_embed.to(torch.bfloat16)
-        )
-        eager_assert(
-            text_condition.shape,
-            (B, T, self.text_token_size, self.rdt_hidden_size),
-        )
-        text_condition = text_condition.reshape(
-            B * T, self.text_token_size, self.rdt_hidden_size
-        )
-        text_condition_mask = text_tokens_embed.abs().sum(dim=-1).reshape(
-            B * T, self.text_token_size
-        ) > 0
+    def _predict_rdt_denoising_target(
+        self,
+        noisy_actions: torch.Tensor,
+        timesteps: torch.Tensor,
+        action_out_tokens: torch.Tensor,
+        image_tokens: torch.Tensor,
+        state_actions: torch.Tensor,
+        valid_step_mask: torch.Tensor,
+        condition_step_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        rdt_input_dtype = self.rdt_policy_head.action_embedder.weight.dtype
+        with self._rdt_forward_context(noisy_actions.device):
+            (
+                state_condition,
+                action_condition,
+                image_condition,
+                action_condition_mask,
+                image_condition_mask,
+            ) = self._build_rdt_conditions(
+                action_out_tokens=action_out_tokens,
+                image_tokens=image_tokens,
+                state_actions=state_actions,
+                valid_step_mask=valid_step_mask,
+                condition_step_mask=condition_step_mask,
+            )
+            action_preds = self.rdt_policy_head(
+                x=noisy_actions.to(rdt_input_dtype),
+                t=timesteps,
+                img_c=image_condition,
+                act_c=action_condition,
+                state_c=state_condition,
+                img_mask=image_condition_mask,
+                act_mask=action_condition_mask,
+                embed_input=True,
+                decode_output=True,
+            )
+        eager_assert(action_preds.shape, noisy_actions.shape)
+        return action_preds.float()
 
-        action_preds = self.rdt_policy_head(
-            x=action_tokens_for_rdt.reshape(
-                B * T, self.n_actions, self.rdt_hidden_size
-            ),
-            t=torch.zeros(B * T, device=action_out_embeddings.device, dtype=torch.long),
-            act_c=text_condition,
-            state_c=state_tokens,
-            act_mask=text_condition_mask,
-            decode_output=True,
-        ).squeeze(-1)
-        eager_assert(action_preds.shape, (B * T, self.n_actions))
-        action_preds = action_preds.reshape(B, T, self.n_actions)
-        eager_assert(action_preds.shape, (B, T, self.n_actions))
-        return action_preds
+    def _denoise_action_sequence(
+        self,
+        action_out_tokens: torch.Tensor,
+        image_tokens: torch.Tensor,
+        action_shape_source: torch.Tensor,
+        state_actions: torch.Tensor,
+        valid_step_mask: torch.Tensor,
+        compile: bool = True,
+    ) -> torch.Tensor:
+        del compile
+        sample = torch.randn_like(action_shape_source)
+        scheduler = self.rdt_inference_scheduler
+        timesteps = scheduler.timesteps.to(action_shape_source.device)
+        for step_idx, timestep in enumerate(timesteps):
+            timestep_batch = torch.full(
+                (action_shape_source.shape[0],),
+                float(timestep.item()),
+                dtype=torch.float32,
+                device=action_shape_source.device,
+            )
+            model_output = self._predict_rdt_denoising_target(
+                noisy_actions=sample,
+                timesteps=timestep_batch,
+                action_out_tokens=action_out_tokens,
+                image_tokens=image_tokens,
+                state_actions=state_actions,
+                valid_step_mask=valid_step_mask,
+            )
+            sample = scheduler.step(
+                model_output=model_output,
+                timestep=timestep_batch,
+                sample=sample,
+                to_final=(step_idx + 1 == len(timesteps)),
+            )
+        eager_assert(sample.shape, action_shape_source.shape)
+        return sample
+
+    def action_tokens_to_actions(
+        self,
+        action_out_tokens: torch.Tensor,
+        image_tokens: torch.Tensor,
+        action_shape_source: torch.Tensor,
+        state_actions: Optional[torch.Tensor] = None,
+        valid_step_mask: Optional[torch.Tensor] = None,
+        compile: bool = True,
+    ) -> torch.Tensor:
+        if state_actions is None:
+            state_actions = action_shape_source
+        if valid_step_mask is None:
+            valid_step_mask = torch.ones(
+                action_shape_source.shape[0],
+                action_shape_source.shape[1],
+                dtype=torch.bool,
+                device=action_shape_source.device,
+            )
+        return self._denoise_action_sequence(
+            action_out_tokens=action_out_tokens,
+            image_tokens=image_tokens,
+            action_shape_source=action_shape_source,
+            state_actions=state_actions,
+            valid_step_mask=valid_step_mask,
+            compile=compile,
+        )
 
     def action_out_tokens_to_logits(
         self, action_out_tokens: torch.Tensor
@@ -582,6 +932,31 @@ class PolicyModelTrainer(ModelFreePolicy):
         # inspect (unscaled) gradients here
         if self.global_step % 100 == 0:
             self.log_dict(grad_norm(self, norm_type=2))
+
+    def on_fit_start(self):
+        if not self._force_stable_rdt_training:
+            return
+        converted_tensors = 0
+        converted_params = 0
+        for optimizer in self.trainer.optimizers:
+            for param, state in optimizer.state.items():
+                if not isinstance(param, torch.Tensor) or param.dtype != torch.float32:
+                    continue
+                param_converted = False
+                for key, value in list(state.items()):
+                    if torch.is_tensor(value) and value.is_floating_point() and value.dtype != torch.float32:
+                        state[key] = value.float()
+                        converted_tensors += 1
+                        param_converted = True
+                if param_converted:
+                    converted_params += 1
+        if converted_tensors > 0:
+            logging.warning(
+                "Upcast %s resumed optimizer-state tensors across %s fp32 parameters "
+                "to improve stage3 bf16 resume stability.",
+                converted_tensors,
+                converted_params,
+            )
 
     def init_from_stage2_model(self, stage2_model):
         super().copy_weights(stage2_model)
@@ -623,43 +998,71 @@ class PolicyModelTrainer(ModelFreePolicy):
         )
 
     def _calculate_loss(self, batch, actions_in, masked_labels, text_tokens_embed):
-        """Calculate the regression loss for continuous robot actions."""
+        """Calculate the denoising loss for the StreamVGGT-style RDT head."""
         frames = self._normalize_frames(batch.frames)
         batch_size = batch.frames.shape[0]
         T = batch.frames.shape[1]
+        valid_step_mask = self._get_rdt_valid_step_mask(
+            batch.frames,
+            valid_step_mask=batch.valid_frame_mask,
+        )
         action_embeddings_in = self.action_in_to_tokens(actions_in)
         eager_assert(
             action_embeddings_in.shape,
             (
                 batch_size,
                 T,
-                self.n_actions,
-                self.config.policy_model.action_decoder.embed_dim,
+                self.transformer_n_action_tokens,
+                self.config.policy_model.transformer_dim,
             ),
         )
-        action_out_embeddings, action_out_tokens, auxiliary_losses, auxiliary_outputs = (
-            self.transformer_forward_function(
-                frames, action_embeddings_in, text_tokens_embed
-            )
+        (
+            _,
+            action_out_tokens,
+            image_tokens,
+            auxiliary_losses,
+            auxiliary_outputs,
+        ) = self.transformer_forward_function(
+            frames, action_embeddings_in, text_tokens_embed
         )
         eager_assert(
-            action_out_embeddings.shape,
-            (
-                batch_size,
-                T,
-                self.n_actions,
-                self.config.policy_model.action_decoder.embed_dim,
-            ),
+            action_out_tokens.shape,
+            (batch_size, T, self.config.policy_model.transformer_dim),
         )
 
-        action_preds = self.action_tokens_to_actions(
-            action_out_embeddings,
-            action_out_tokens,
-            text_tokens_embed,
+        noisy_actions, action_targets, timesteps, action_loss_weights = (
+            self._sample_noisy_action_sequence(actions_in)
         )
-        action_targets = masked_labels["targets"]
-        action_mask = masked_labels["mask"].to(action_preds.dtype)
-        squared_error = (action_preds - action_targets).pow(2)
+        # Align RDT conditioning visibility with the supervised action steps.
+        condition_step_mask = masked_labels["mask"].bool().any(dim=-1)
+        action_preds = self._predict_rdt_denoising_target(
+            noisy_actions=noisy_actions,
+            timesteps=timesteps,
+            action_out_tokens=action_out_tokens,
+            image_tokens=image_tokens,
+            state_actions=actions_in,
+            valid_step_mask=valid_step_mask,
+            condition_step_mask=condition_step_mask,
+        )
+        action_mask_bool = masked_labels["mask"].bool()
+        masked_action_preds = torch.where(
+            action_mask_bool,
+            action_preds,
+            torch.zeros_like(action_preds),
+        )
+        masked_action_targets = torch.where(
+            action_mask_bool,
+            action_targets,
+            torch.zeros_like(action_targets),
+        )
+        auxiliary_outputs["nonfinite_action_pred_count"] = (
+            ~torch.isfinite(masked_action_preds)
+        ).sum()
+        auxiliary_outputs["nonfinite_action_target_count"] = (
+            ~torch.isfinite(masked_action_targets)
+        ).sum()
+        action_mask = action_mask_bool.to(action_preds.dtype)
+        squared_error = (masked_action_preds - masked_action_targets).pow(2) * action_loss_weights
         denom = action_mask.sum().clamp_min(1.0)
         robot_action_mse = (squared_error * action_mask).sum() / denom
 
@@ -695,7 +1098,10 @@ class PolicyModelTrainer(ModelFreePolicy):
             user_action_mask, valid_frame_mask, system_action_mask
         )
         actions_in = batch.action_annotations.float()
-        action_mask = effective_mask.unsqueeze(-1).expand_as(actions_in)
+        if batch.action_mask is not None and batch.action_mask.shape == actions_in.shape:
+            action_mask = batch.action_mask.bool() & effective_mask.unsqueeze(-1)
+        else:
+            action_mask = effective_mask.unsqueeze(-1).expand_as(actions_in)
         masked_labels = {
             "targets": batch.action_annotations.float(),
             "mask": action_mask,
@@ -736,6 +1142,8 @@ class PolicyModelTrainer(ModelFreePolicy):
             "system_action_mask": batch.system_action_mask.shape[1],
             "text_embeddings": batch.text_embeddings.shape[1],
         }
+        if batch.action_mask is not None:
+            lengths["action_mask"] = batch.action_mask.shape[1]
         if batch.valid_frame_mask is not None:
             lengths["valid_frame_mask"] = batch.valid_frame_mask.shape[1]
 
@@ -750,6 +1158,7 @@ class PolicyModelTrainer(ModelFreePolicy):
             )
 
     def training_step(self, batch, batch_idx):
+        self._current_batch_idx = batch_idx
         if self.trainer.global_step == 0:
             logging.info(
                 f"First training step starting (compilation may take awhile). rank={self.trainer.global_rank}"
@@ -775,6 +1184,23 @@ class PolicyModelTrainer(ModelFreePolicy):
         loss, losses, robot_action_mse, auxiliary_outputs = compiled_training_step(
             batch
         )
+
+        nonfinite_action_pred_count = int(
+            auxiliary_outputs["nonfinite_action_pred_count"].detach().cpu().item()
+        )
+        nonfinite_action_target_count = int(
+            auxiliary_outputs["nonfinite_action_target_count"].detach().cpu().item()
+        )
+        if nonfinite_action_pred_count > 0:
+            raise RuntimeError(
+                "Non-finite action predictions on valid/masked-in positions: "
+                f"count={nonfinite_action_pred_count}, global_step={self.trainer.global_step}, batch_idx={batch_idx}."
+            )
+        if nonfinite_action_target_count > 0:
+            raise RuntimeError(
+                "Non-finite action targets on valid/masked-in positions: "
+                f"count={nonfinite_action_target_count}, global_step={self.trainer.global_step}, batch_idx={batch_idx}."
+            )
 
         if self.trainer.global_step == 0:
             logging.info(
@@ -943,10 +1369,22 @@ class Stage3LabelledBCLightning(PolicyModelTrainer):
             stage_name="stage3_finetune",
             inference_mode=inference_mode,
         )
-        if self.config.policy_model.model_type == "sparse_moe":
-            self.compile_mode = torch.compile(fullgraph=True)
+        if self._force_stable_rdt_training:
+            self.compile_mode = lambda fn: fn
+            logging.warning(
+                "Keeping torch.compile disabled for stage3 bf16 RDT training "
+                "stability."
+            )
+        elif self.config.shared.enable_torch_compile:
+            if self.config.policy_model.model_type == "sparse_moe":
+                self.compile_mode = torch.compile(fullgraph=True)
+            else:
+                self.compile_mode = torch.compile(fullgraph=True, mode="max-autotune")
         else:
-            self.compile_mode = torch.compile(fullgraph=True, mode="max-autotune")
+            self.compile_mode = lambda fn: fn
+            logging.warning(
+                "torch.compile is disabled by config.shared.enable_torch_compile; using eager execution for stage3 training."
+            )
 
         self.transformer_forward_function = self.bc_transformer.forward
 
@@ -956,6 +1394,11 @@ class Stage3LabelledBCLightning(PolicyModelTrainer):
 
     def configure_optimizers(self):
         assert not self.inference_mode
+        use_fused_adamw = not self._force_stable_rdt_training
+        if not use_fused_adamw:
+            logging.warning(
+                "Disabling fused AdamW for stage3 bf16 stability so Lightning gradient clipping can run."
+            )
         optimizer = optim.AdamW(
             self.parameters(),
             lr=self.config.stage3_finetune.optim.learning_rate,
@@ -964,16 +1407,17 @@ class Stage3LabelledBCLightning(PolicyModelTrainer):
                 self.config.stage3_finetune.optim.beta_2,
             ),
             weight_decay=self.config.stage3_finetune.optim.weight_decay,
-            fused=True,
+            fused=use_fused_adamw,
         )
         return [optimizer]
 
     def on_train_batch_start(self, batch, batch_idx):
         global_step = self.trainer.global_step
+        freeze_steps = self.config.stage3_finetune.freeze_transformer_layers_for_steps
         # This will get called multiple times if gradient accumulation is used.
         if (
             global_step == 0
-            and self.config.stage3_finetune.freeze_transformer_layers_for_steps > 0
+            and freeze_steps > 0
             and not self._already_frozen
         ):
             logging.warning("Freezing transformer layers.")
@@ -983,8 +1427,8 @@ class Stage3LabelledBCLightning(PolicyModelTrainer):
                 param.requires_grad = False
             self._already_frozen = True
         elif (
-            global_step
-            == self.config.stage3_finetune.freeze_transformer_layers_for_steps
+            freeze_steps > 0
+            and global_step == freeze_steps
             and not self._already_unfrozen
         ):
             logging.warning("Unfreezing transformer layers.")
@@ -1052,6 +1496,7 @@ class SupervisedDataModule(pl.LightningDataModule):
         return DataLoader(**dataloader_kwargs)
 
     def _init_train_dataset(self):
+        MultiLatentLeRobotDataset, _ = _load_lerobot_dataset_support()
         return MultiLatentLeRobotDataset(self.training_dataset_cfg)
 
     def _init_dummy_dataset(self):
@@ -1085,6 +1530,7 @@ class SupervisedDataModule(pl.LightningDataModule):
         )
 
         self.validation_datasets = {}
+        MultiLatentLeRobotDataset, _ = _load_lerobot_dataset_support()
         for i, validation_dataset_cfg in enumerate(self.validation_dataset_cfgs):
             validation_dataset = MultiLatentLeRobotDataset(validation_dataset_cfg)
             self.validation_datasets[validation_dataset_cfg.validation_name] = (
@@ -1122,12 +1568,215 @@ class Stage3DataModule(SupervisedDataModule):
         return True
 
 
+def _probe_requested_gpu_indices(requested_indices: list[int]) -> tuple[list[int], dict[int, str]]:
+    probe_code = """
+import torch
+
+torch.cuda.init()
+torch.cuda.set_device(0)
+x = torch.empty(1, device='cuda')
+print('probe_ok', x.device)
+"""
+    usable_indices: list[int] = []
+    failed_indices: dict[int, str] = {}
+    for device_idx in requested_indices:
+        env = os.environ.copy()
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        env["CUDA_VISIBLE_DEVICES"] = str(device_idx)
+        env["ELEFANT_STAGE3_GPU_PROBE"] = "1"
+        result = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        if result.returncode == 0:
+            usable_indices.append(device_idx)
+            continue
+        stderr = (result.stderr or result.stdout or "probe failed").strip().splitlines()
+        failed_indices[device_idx] = stderr[-1] if stderr else "probe failed"
+    return usable_indices, failed_indices
+
+
+def _query_gpu_inventory_via_nvidia_smi() -> tuple[list[dict], set[str]] | None:
+    if shutil.which("nvidia-smi") is None:
+        return None
+
+    try:
+        query = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,uuid,memory.free,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        compute_query = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=gpu_uuid",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        logging.warning(
+            "Failed to query GPUs via nvidia-smi (%s); leaving Lightning GPU selection on auto.",
+            exc,
+        )
+        return None
+
+    busy_gpu_uuids = {
+        row.strip()
+        for row in compute_query.stdout.splitlines()
+        if row.strip() and not row.lower().startswith("no running")
+    }
+    gpu_rows = [row.strip() for row in query.stdout.splitlines() if row.strip()]
+    inventory = []
+    for row in gpu_rows:
+        index_str, gpu_uuid, free_mb_str, total_mb_str = [part.strip() for part in row.split(",")]
+        inventory.append(
+            {
+                "index": int(index_str),
+                "uuid": gpu_uuid,
+                "free_mb": int(free_mb_str),
+                "total_mb": int(total_mb_str),
+            }
+        )
+    return inventory, busy_gpu_uuids
+
+
+def _select_training_gpus() -> tuple[str, int | str]:
+    inventory_result = _query_gpu_inventory_via_nvidia_smi()
+
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        visible_devices = [
+            part.strip()
+            for part in os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+            if part.strip()
+        ]
+        requested_indices = [int(device) for device in visible_devices]
+        if inventory_result is not None:
+            inventory, busy_gpu_uuids = inventory_result
+            inventory_by_index = {item["index"]: item for item in inventory}
+            requested_stats = []
+            for device_idx in requested_indices:
+                item = inventory_by_index.get(device_idx)
+                if item is None:
+                    requested_stats.append(f"gpu{device_idx}: unknown")
+                    continue
+                free_gib = item["free_mb"] / 1024.0
+                total_gib = item["total_mb"] / 1024.0
+                free_ratio = item["free_mb"] / max(item["total_mb"], 1)
+                has_compute_process = item["uuid"] in busy_gpu_uuids
+                status = "busy" if has_compute_process else "idle"
+                requested_stats.append(
+                    f"gpu{device_idx}: {status}, free={free_gib:.1f}GiB/{total_gib:.1f}GiB ({free_ratio:.0%})"
+                )
+            logging.info(
+                "Requested CUDA_VISIBLE_DEVICES inventory: %s",
+                ", ".join(requested_stats),
+            )
+
+        usable_indices, failed_indices = _probe_requested_gpu_indices(requested_indices)
+        if usable_indices and len(usable_indices) != len(requested_indices):
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, usable_indices))
+            logging.warning(
+                "Requested CUDA_VISIBLE_DEVICES=%s contains GPUs that failed a live CUDA probe; using subset %s. Failures: %s",
+                ",".join(map(str, requested_indices)),
+                usable_indices,
+                failed_indices,
+            )
+            visible_devices = [str(idx) for idx in usable_indices]
+        elif not usable_indices:
+            raise RuntimeError(
+                "None of the requested CUDA_VISIBLE_DEVICES passed a live CUDA probe. "
+                f"Requested={requested_indices}, failures={failed_indices}"
+            )
+
+        logging.info(
+            "Respecting existing CUDA_VISIBLE_DEVICES=%s for stage3 training.",
+            os.environ["CUDA_VISIBLE_DEVICES"],
+        )
+        return "gpu", max(len(visible_devices), 1)
+
+    if inventory_result is None:
+        logging.warning(
+            "nvidia-smi is unavailable; leaving Lightning GPU selection on auto."
+        )
+        return "auto", "auto"
+
+    inventory, busy_gpu_uuids = inventory_result
+    if not inventory:
+        return "auto", "auto"
+
+    free_gpu_indices: list[int] = []
+    gpu_stats: list[str] = []
+    for item in inventory:
+        device_idx = item["index"]
+        free_mb = item["free_mb"]
+        total_mb = item["total_mb"]
+        free_gib = free_mb / 1024.0
+        total_gib = total_mb / 1024.0
+        free_ratio = free_mb / max(total_mb, 1)
+        has_compute_process = item["uuid"] in busy_gpu_uuids
+        status = "busy" if has_compute_process else "idle"
+        gpu_stats.append(
+            f"gpu{device_idx}: {status}, free={free_gib:.1f}GiB/{total_gib:.1f}GiB ({free_ratio:.0%})"
+        )
+        if (not has_compute_process) and free_gib >= 8.0 and free_ratio >= 0.5:
+            free_gpu_indices.append(device_idx)
+
+    if gpu_stats:
+        logging.info(
+            "Stage3 GPU availability before trainer creation: %s",
+            ", ".join(gpu_stats),
+        )
+
+    if not free_gpu_indices:
+        logging.warning(
+            "No clearly free GPUs detected; leaving Lightning GPU selection on auto."
+        )
+        return "auto", "auto"
+
+    if len(free_gpu_indices) == len(gpu_rows):
+        return "gpu", len(free_gpu_indices)
+
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, free_gpu_indices))
+    logging.warning(
+        "Auto-selected currently available GPUs %s for stage3 training and exported CUDA_VISIBLE_DEVICES=%s.",
+        free_gpu_indices,
+        os.environ["CUDA_VISIBLE_DEVICES"],
+    )
+    return "gpu", len(free_gpu_indices)
+
+
+def _init_stage3_model_for_trainer(
+    trainer: pl.Trainer,
+    config: LightningPolicyConfig,
+):
+    try:
+        with trainer.init_module():
+            return _init_stage3_model(config)
+    except torch.AcceleratorError as exc:
+        logging.warning(
+            "trainer.init_module() hit a CUDA startup error (%s); falling back to CPU model construction before Lightning moves the model to devices.",
+            exc,
+        )
+        return _init_stage3_model(config)
+
+
 def train_stage3_finetune(config: LightningPolicyConfig):
     _sync_sequence_length_with_dataset(config)
     _sync_text_embedding_shape_with_dataset(config)
     resume_ckpt_path = _resolve_resume_checkpoint_path(config)
     if resume_ckpt_path is not None:
-        _validate_resume_checkpoint_compatibility(resume_ckpt_path, config)
+        _validate_resume_checkpoint_compatibility(resume_ckpt_path, config)            
     datamodule = Stage3DataModule(config)
     # This is for start_experiment.py type jobs
     run_id = getattr(config.wandb, "run_id", None) or os.environ.get("WANDB_RUN_ID")
@@ -1165,9 +1814,32 @@ def train_stage3_finetune(config: LightningPolicyConfig):
         save_top_k=-1,
     )
 
-    if torch.cuda.device_count() > 1:
-        logging.info(f"Using DDP strategy with {torch.cuda.device_count()} GPUs")
-        strategy = pl.pytorch.strategies.DDPStrategy(find_unused_parameters=True)
+    accelerator, devices = _select_training_gpus()
+    selected_gpu_count = devices if isinstance(devices, int) else 1
+
+    if accelerator == "gpu" and selected_gpu_count > 1:
+        logging.info(f"Using DDP strategy with {selected_gpu_count} GPUs")
+        freeze_steps = config.stage3_finetune.freeze_transformer_layers_for_steps
+        if freeze_steps == 0:
+            logging.info(
+                "Using static-graph DDP for stage3 training: this model uses a fixed "
+                "parameter graph, and disabling unused-parameter discovery avoids "
+                "NCCL bucket/broadcast mismatches under torch.compile."
+            )
+            strategy = pl.pytorch.strategies.DDPStrategy(
+                find_unused_parameters=False,
+                static_graph=True,
+                gradient_as_bucket_view=True,
+            )
+        else:
+            logging.info(
+                "Keeping dynamic DDP because freeze_transformer_layers_for_steps=%s "
+                "changes parameter participation during training.",
+                freeze_steps,
+            )
+            strategy = pl.pytorch.strategies.DDPStrategy(
+                find_unused_parameters=True,
+            )
     else:
         logging.info("Using SingleDeviceStrategy for single GPU.")
         # strategy = pl.pytorch.strategies.SingleDeviceStrategy(accelerator="auto")
@@ -1178,10 +1850,10 @@ def train_stage3_finetune(config: LightningPolicyConfig):
     trainer = pl.Trainer(
         plugins=[async_checkpointer],
         callbacks=[checkpoint_callback],
-        accelerator="auto",
+        accelerator=accelerator,
         # For debugging it can be useful to set devices to 1.
         # for simpler stack traces etc.
-        devices="auto",
+        devices=devices,
         max_steps=config.stage3_finetune.n_training_steps,
         logger=wandb_logger,
         # We multiply by accumulate_grad_batches to get the number of steps between validation steps in "real" steps.
@@ -1191,6 +1863,8 @@ def train_stage3_finetune(config: LightningPolicyConfig):
         check_val_every_n_epoch=None,
         precision=config.shared.precision,
         accumulate_grad_batches=config.stage3_finetune.accumulate_grad_batches,
+        gradient_clip_algorithm="norm",
+        gradient_clip_val=1.0 if "bf16" in str(config.shared.precision).lower() else 0.0,
         fast_dev_run=config.shared.fast_dev_run,
         strategy=strategy,
         # We already run validation before training starts.
@@ -1198,11 +1872,9 @@ def train_stage3_finetune(config: LightningPolicyConfig):
         # profiler="simple",
     )
 
-    # Initialize model on the correct device using PyTorch Lightning's device management
-    # Disable if using FSDP or DeepSpeed.
-    # https://lightning.ai/docs/pytorch/stable/advanced/model_init.html
-    with trainer.init_module():
-        model = _init_stage3_model(config)
+    # Prefer Lightning-managed device-aware init, but fall back to plain CPU
+    # construction if CUDA is temporarily unavailable during startup.
+    model = _init_stage3_model_for_trainer(trainer, config)
 
     total_params, expert_params = count_model_parameters(model)
     logging.info(

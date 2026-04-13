@@ -1,11 +1,12 @@
 shared:
-  output_path: /data/jsy/open-p2p/train_out/150M_lerobot_rdt_dim30
-  n_seq_timesteps: 200
+  output_path: /data/jsy/open-p2p/train_out/150M_lerobot_rdt_multiview_noised_action_cond_new_with_stat_cond
+  enable_torch_compile: true
+  n_seq_timesteps: 128
   frame_height: &frame_height 192
   frame_width: &frame_width 192
   precision: bf16-mixed
   text_tokenizer_config:
-    text_tokenizer_name: "gemma"
+    text_tokenizer_name: "lingbot"
     text_embedding_shape: [1, 4096]
     text_annotation_model_version: ["gemini-2.5-flash", "gemini-2.5-flash-thinking-0905"]
   tokenizer:
@@ -23,11 +24,9 @@ policy_model:
   n_thinking_tokens: 1
   transformer_dim: &transformer_dim 1024
   mask_block_size: 128
-  attention_history_len: [200, 200, 200, 200, 200, 200, 200, 200, 200, 200]
+  attention_history_len: [128, 128, 128, 128, 128, 128, 128, 128, 128, 128]
   n_kv_sink_tokens: 0
   model_type: "dense"
-  action_decoder:
-    embed_dim: *transformer_dim
   rdt:
     hidden_size: *transformer_dim
     depth: 4
@@ -38,6 +37,15 @@ policy_model:
     ffn_dim_multiplier: null
     use_flash_attn: true
     num_register_tokens: 4
+    use_state_condition: true
+    use_image_condition: true
+    num_train_timesteps: 1000
+    num_inference_steps: 100
+    flow_match_shift: 3.0
+    sigma_max: 1.0
+    sigma_min: 0.0029940119760479044
+    extra_one_step: true
+    action_condition_noise_std: 0.01  # try 0.01-0.02 as a regularization sweep
 
 stage3_finetune:
   optim:
@@ -47,21 +55,33 @@ stage3_finetune:
     beta_2: 0.999
 
   validation_step_interval: 500
-  n_validation_steps: 200
-  save_every_n_steps: 200
-  n_training_steps: 1000
+  n_validation_steps: 2000
+  save_every_n_steps: 1000
+  n_training_steps: 20000
   accumulate_grad_batches: 1
+  freeze_transformer_layers_for_steps: 0
 
   training_dataset:
     batch_size: 1
     shuffle: true
     dataset_path: "/mnt/nas/datasets5/robotwin_lerobot"
     single_task: "adjust_bottle"
-    empty_emb_path: /abs/path/to/empty_emb.pt
-    obs_cam_keys: ["cam_high"]
+    empty_emb_path: /mnt/nas/datasets5/robotwin_lerobot/empty_emb.pt
+    # obs_cam_keys: ["cam_high"]
+    obs_cam_keys: ["cam_high", "cam_left_wrist", "cam_right_wrist"]
+    multi_view_image_mode: "token_concat"
+    # multi_view_image_mode: "first"
     norm_stat:
-      q01: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-      q99: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      q01:
+        [-0.06172713458538055, -3.6716461181640625e-05, -0.08783501386642456, -1,
+        -1, -1, -1, -0.3547105032205582, -1.3113021850585938e-06,
+        -0.11975435614585876, -1, -1, -1, -1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      q99:
+        [0.3462600058317184, 0.39966784834861746, 0.14745532035827624, 1, 1, 1, 1,
+        0.034201726913452024, 0.39142737388610793, 0.1792279863357542, 1, 1, 1, 1,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        1.0, 1.0]
     image_height: *frame_height
     image_width: *frame_width
     image_frame_stride: 1

@@ -1,0 +1,11 @@
+robowin_root: /data/jsy/RoboTwin
+host: 127.0.0.1
+port: 29056
+save_root: /data/jsy/open-p2p/eval_result/robotwin
+policy_name: open_p2p_remote
+task_name: adjust_bottle
+task_config: demo_clean
+ckpt_setting: 150M_lerobot_rdt_summary_projection
+seed: 0
+test_num: 10
+instruction_type: seen

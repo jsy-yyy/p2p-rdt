@@ -12,7 +12,7 @@ from elefant.policy_model.transformer import SparseMoEConfig
 import torch
 from elefant.torch import eager_assert
 from elefant.im_tokenizer import get_tokenizer
-from elefant.policy_model.action_decoder import ActionDecoderConfig
+from elefant.im_tokenizer.multi_view_tokenizer import MultiViewTokenConcatTokenizer
 
 
 class ModelFreePolicy(pl.LightningModule):
@@ -33,10 +33,9 @@ class ModelFreePolicy(pl.LightningModule):
             config=self.config.shared.action_mapping
         )
 
-        # for stage2 and stage3 policy model, the model attend to real actions
-        self.transformer_n_action_tokens = (
-            self.config.stage3_finetune.training_dataset.get_robot_action_dim()
-        )
+        # Continuous robot actions are embedded into a single action token per timestep
+        # before entering the policy transformer, matching the VA conditioning path.
+        self.transformer_n_action_tokens = 1
         self.text_token_size = (
             self.config.shared.text_tokenizer_config.text_embedding_shape[0]
         )
@@ -50,6 +49,12 @@ class ModelFreePolicy(pl.LightningModule):
             config.shared.frame_height,
             config.shared.frame_width,
         )
+        if config.stage3_finetune.training_dataset.multi_view_image_mode == "token_concat":
+            num_views = len(config.stage3_finetune.training_dataset.obs_cam_keys)
+            self.image_tokenizer = MultiViewTokenConcatTokenizer(
+                self.image_tokenizer,
+                num_views=num_views,
+            )
 
         # only used when model_type is sparse_moe
         sparse_moe_config = SparseMoEConfig(
@@ -71,11 +76,6 @@ class ModelFreePolicy(pl.LightningModule):
                     attention_history_len=config.policy_model.attention_history_len,
                     model_type=config.policy_model.model_type,
                     sparse_moe=sparse_moe_config,
-                    action_decoder=ActionDecoderConfig(
-                        embed_dim=config.policy_model.action_decoder.embed_dim,
-                        n_action_tokens=self.transformer_n_action_tokens + 1,
-                        input_action_token_dim=config.policy_model.transformer_dim,
-                    ),
                 ),
                 image_tokenizer=self.image_tokenizer,
                 inference_mode=inference_mode,
@@ -93,11 +93,6 @@ class ModelFreePolicy(pl.LightningModule):
                     n_thinking_tokens=config.policy_model.n_thinking_tokens,
                     attention_history_len=config.policy_model.attention_history_len,
                     model_type=config.policy_model.model_type,
-                    action_decoder=ActionDecoderConfig(
-                        embed_dim=config.policy_model.action_decoder.embed_dim,
-                        n_action_tokens=self.transformer_n_action_tokens + 1,
-                        input_action_token_dim=config.policy_model.transformer_dim,
-                    ),
                     n_kv_sink_tokens=config.policy_model.n_kv_sink_tokens,
                     n_action_tokens=self.transformer_n_action_tokens,
                     text_token_size=self.text_token_size,

@@ -8,6 +8,11 @@ class GemmaTextTokenizerConfig(ConfigBase):
     max_position_embeddings: int = 128
 
 
+class LingbotTextTokenizerConfig(ConfigBase):
+    model_root: str = "/data/jsy/lingbot-va/lingbot-va-base"
+    max_position_embeddings: int = 226
+
+
 class DummyTextTokenizerConfig(ConfigBase):
     model_id: str = "dummy"
 
