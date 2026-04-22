@@ -1,5 +1,5 @@
 shared:
-  output_path: /data/jsy/open-p2p/train_out/150M_lerobot_rdt_multiview_noised_action_cond_new_with_stat_cond
+  output_path: /data/jsy/open-p2p/train_out/150M_lerobot_rdt_adjust_bottle_multiview_cond_new_wo_stat_init_from_pretrain_nofreeze
   enable_torch_compile: true
   n_seq_timesteps: 128
   frame_height: &frame_height 192
@@ -37,7 +37,7 @@ policy_model:
     ffn_dim_multiplier: null
     use_flash_attn: true
     num_register_tokens: 4
-    use_state_condition: true
+    use_state_condition: false
     use_image_condition: true
     num_train_timesteps: 1000
     num_inference_steps: 100

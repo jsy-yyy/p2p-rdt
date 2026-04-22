@@ -59,10 +59,66 @@ def _expand_norm_stat(
 
 def _normalize_quaternion(quat: np.ndarray) -> np.ndarray:
     quat = np.asarray(quat, dtype=np.float32).reshape(4)
+    if not np.all(np.isfinite(quat)):
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
     norm = np.linalg.norm(quat)
-    if norm < 1e-8:
+    if not np.isfinite(norm) or norm < 1e-8:
         return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
     return quat / norm
+
+
+def sanitize_pose_8d(
+    pose_8d: np.ndarray,
+    fallback_pose_8d: np.ndarray | None = None,
+) -> tuple[np.ndarray, bool]:
+    pose_8d = np.asarray(pose_8d, dtype=np.float32).reshape(8).copy()
+    if fallback_pose_8d is None:
+        fallback_pose_8d = np.zeros(8, dtype=np.float32)
+        fallback_pose_8d[3:7] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    else:
+        fallback_pose_8d = np.asarray(fallback_pose_8d, dtype=np.float32).reshape(8)
+
+    changed = False
+
+    if not np.all(np.isfinite(pose_8d[:3])):
+        pose_8d[:3] = fallback_pose_8d[:3]
+        changed = True
+
+    quat = pose_8d[3:7]
+    quat_is_invalid = (not np.all(np.isfinite(quat))) or float(
+        np.linalg.norm(np.nan_to_num(quat, nan=0.0, posinf=0.0, neginf=0.0))
+    ) < 1e-8
+    if quat_is_invalid:
+        pose_8d[3:7] = _normalize_quaternion(fallback_pose_8d[3:7])
+        changed = True
+    else:
+        normalized_quat = _normalize_quaternion(quat)
+        if not np.allclose(normalized_quat, quat, atol=1e-5, rtol=1e-5):
+            pose_8d[3:7] = normalized_quat
+            changed = True
+
+    if not np.all(np.isfinite(pose_8d[7:8])):
+        pose_8d[7:8] = fallback_pose_8d[7:8]
+        changed = True
+
+    return pose_8d.astype(np.float32), changed
+
+
+def sanitize_compact_pose_16d(
+    pose_16d: np.ndarray,
+    fallback_pose_16d: np.ndarray | None = None,
+) -> tuple[np.ndarray, bool]:
+    pose_16d = np.asarray(pose_16d, dtype=np.float32).reshape(16)
+    if fallback_pose_16d is None:
+        fallback_pose_16d = np.zeros(16, dtype=np.float32)
+        fallback_pose_16d[3:7] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        fallback_pose_16d[11:15] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    else:
+        fallback_pose_16d = np.asarray(fallback_pose_16d, dtype=np.float32).reshape(16)
+
+    left, left_changed = sanitize_pose_8d(pose_16d[:8], fallback_pose_16d[:8])
+    right, right_changed = sanitize_pose_8d(pose_16d[8:], fallback_pose_16d[8:])
+    return np.concatenate([left, right]).astype(np.float32), left_changed or right_changed
 
 
 def compose_relative_pose(
@@ -78,6 +134,22 @@ def compose_relative_pose(
     absolute_translation = relative_pose[:3] + anchor_pose[:3]
     return np.concatenate(
         [absolute_translation, absolute_rotation, relative_pose[7:8]]
+    ).astype(np.float32)
+
+
+def absolute_to_relative_pose(
+    absolute_pose: np.ndarray,
+    anchor_pose: np.ndarray,
+) -> np.ndarray:
+    absolute_pose = np.asarray(absolute_pose, dtype=np.float32).reshape(8)
+    anchor_pose = np.asarray(anchor_pose, dtype=np.float32).reshape(8)
+    absolute_rotation = R.from_quat(_normalize_quaternion(absolute_pose[3:7])[None])
+    anchor_rotation = R.from_quat(_normalize_quaternion(anchor_pose[3:7])[None])
+    relative_rotation = (anchor_rotation.inv() * absolute_rotation).as_quat().reshape(-1)
+    relative_rotation = _normalize_quaternion(relative_rotation)
+    relative_translation = absolute_pose[:3] - anchor_pose[:3]
+    return np.concatenate(
+        [relative_translation, relative_rotation, absolute_pose[7:8]]
     ).astype(np.float32)
 
 
@@ -112,6 +184,17 @@ def compose_compact_relative_action(
     return np.concatenate([left, right]).astype(np.float32)
 
 
+def absolute_to_relative_compact_action(
+    action_16d: np.ndarray,
+    anchor_pose_16d: np.ndarray,
+) -> np.ndarray:
+    action_16d = np.asarray(action_16d, dtype=np.float32).reshape(16)
+    anchor_pose_16d = np.asarray(anchor_pose_16d, dtype=np.float32).reshape(16)
+    left = absolute_to_relative_pose(action_16d[:8], anchor_pose_16d[:8])
+    right = absolute_to_relative_pose(action_16d[8:], anchor_pose_16d[8:])
+    return np.concatenate([left, right]).astype(np.float32)
+
+
 def rebase_compact_relative_action(
     action_16d: np.ndarray,
     new_anchor_action_16d: np.ndarray,
@@ -122,6 +205,65 @@ def rebase_compact_relative_action(
     )
     left = rebase_relative_pose(action_16d[:8], new_anchor_action_16d[:8])
     right = rebase_relative_pose(action_16d[8:], new_anchor_action_16d[8:])
+    return np.concatenate([left, right]).astype(np.float32)
+
+
+def _slerp_quaternion(
+    start_quat: np.ndarray,
+    end_quat: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    start_quat = _normalize_quaternion(start_quat)
+    end_quat = _normalize_quaternion(end_quat)
+    dot = float(np.dot(start_quat, end_quat))
+    if dot < 0.0:
+        end_quat = -end_quat
+        dot = -dot
+
+    dot = float(np.clip(dot, -1.0, 1.0))
+    if dot > 0.9995:
+        blended = (1.0 - alpha) * start_quat + alpha * end_quat
+        return _normalize_quaternion(blended)
+
+    theta_0 = float(np.arccos(dot))
+    sin_theta_0 = float(np.sin(theta_0))
+    theta = theta_0 * alpha
+    sin_theta = float(np.sin(theta))
+    s0 = float(np.sin(theta_0 - theta) / sin_theta_0)
+    s1 = float(sin_theta / sin_theta_0)
+    return _normalize_quaternion((s0 * start_quat) + (s1 * end_quat))
+
+
+def _blend_absolute_pose(
+    previous_pose: np.ndarray,
+    current_pose: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    previous_pose = np.asarray(previous_pose, dtype=np.float32).reshape(8)
+    current_pose = np.asarray(current_pose, dtype=np.float32).reshape(8)
+    blended_translation = ((1.0 - alpha) * previous_pose[:3]) + (alpha * current_pose[:3])
+    blended_rotation = _slerp_quaternion(previous_pose[3:7], current_pose[3:7], alpha)
+    blended_gripper = ((1.0 - alpha) * previous_pose[7:8]) + (alpha * current_pose[7:8])
+    return np.concatenate(
+        [blended_translation, blended_rotation, blended_gripper]
+    ).astype(np.float32)
+
+
+def smooth_absolute_compact_action(
+    previous_action_16d: np.ndarray,
+    current_action_16d: np.ndarray,
+    alpha: float,
+) -> np.ndarray:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    previous_action_16d = np.asarray(previous_action_16d, dtype=np.float32).reshape(16)
+    current_action_16d = np.asarray(current_action_16d, dtype=np.float32).reshape(16)
+    if alpha <= 0.0:
+        return previous_action_16d.copy()
+    if alpha >= 1.0:
+        return current_action_16d.copy()
+
+    left = _blend_absolute_pose(previous_action_16d[:8], current_action_16d[:8], alpha)
+    right = _blend_absolute_pose(previous_action_16d[8:], current_action_16d[8:], alpha)
     return np.concatenate([left, right]).astype(np.float32)
 
 
@@ -200,32 +342,32 @@ class RobotActionAdapter:
     def rebase_normalized_actions(
         self,
         normalized_actions: np.ndarray,
-        reference_action: np.ndarray,
+        new_anchor_action: np.ndarray,
     ) -> np.ndarray:
         normalized_actions = np.asarray(normalized_actions, dtype=np.float32)
         squeeze = normalized_actions.ndim == 1
         if squeeze:
             normalized_actions = normalized_actions[None, :]
 
-        reference_action = np.asarray(reference_action, dtype=np.float32).reshape(-1)
+        new_anchor_action = np.asarray(new_anchor_action, dtype=np.float32).reshape(-1)
         if normalized_actions.shape[-1] != self.robot_action_dim:
             raise ValueError(
                 f"Expected normalized action dim {self.robot_action_dim}, got {normalized_actions.shape[-1]}."
             )
-        if reference_action.size != self.robot_action_dim:
+        if new_anchor_action.size != self.robot_action_dim:
             raise ValueError(
-                f"Expected reference action dim {self.robot_action_dim}, got {reference_action.size}."
+                f"Expected new anchor action dim {self.robot_action_dim}, got {new_anchor_action.size}."
             )
 
-        reference_full = self.denormalize(reference_action)
-        reference_compact = self.to_compact_execution_action(reference_full)
+        new_anchor_full = self.denormalize(new_anchor_action)
+        new_anchor_compact = self.to_compact_execution_action(new_anchor_full)
         rebased_actions = []
         for normalized_action in normalized_actions:
             full_action = self.denormalize(normalized_action)
             compact_action = self.to_compact_execution_action(full_action)
             rebased_compact = rebase_compact_relative_action(
                 compact_action,
-                reference_compact,
+                new_anchor_compact,
             )
             rebased_full = self.compact_to_full_action(
                 rebased_compact,
@@ -237,6 +379,23 @@ class RobotActionAdapter:
         if squeeze:
             return rebased[0]
         return rebased
+
+    def rebase_normalized_actions_to_observed_anchor(
+        self,
+        normalized_actions: np.ndarray,
+        previous_anchor_pose_16d: np.ndarray,
+        new_anchor_pose_16d: np.ndarray,
+    ) -> np.ndarray:
+        new_anchor_compact = absolute_to_relative_compact_action(
+            action_16d=new_anchor_pose_16d,
+            anchor_pose_16d=previous_anchor_pose_16d,
+        )
+        new_anchor_full = self.compact_to_full_action(new_anchor_compact)
+        new_anchor_normalized = self.normalize(new_anchor_full)
+        return self.rebase_normalized_actions(
+            normalized_actions=normalized_actions,
+            new_anchor_action=new_anchor_normalized,
+        )
 
 
 class RobotTwinObservationAdapter:

@@ -22,8 +22,11 @@ from elefant.text_tokenizer.factory import get_text_tokenizer
 from .common import (
     RobotActionAdapter,
     RobotTwinObservationAdapter,
+    absolute_to_relative_compact_action,
     compose_compact_relative_action,
     resolve_checkpoint_path,
+    sanitize_compact_pose_16d,
+    smooth_absolute_compact_action,
 )
 from .websocket_policy_server import WebsocketPolicyServer
 
@@ -101,6 +104,10 @@ class RobotTwinSequenceInferenceState:
     compile: bool
     text_tokenizer: Any
     action_adapter: RobotActionAdapter
+    legacy_inference: bool = False
+    warm_start_blend: float = 0.85
+    warm_start_noise_std: float = 0.03
+    action_smoothing_alpha: float = 0.35
 
     def __post_init__(self) -> None:
         self.seq_len = int(self.config.shared.n_seq_timesteps)
@@ -119,6 +126,8 @@ class RobotTwinSequenceInferenceState:
             device=self.device,
             dtype=torch.float32,
         )
+        self.prev_action_preds: torch.Tensor | None = None
+        self.prev_executed_absolute_action_16d: np.ndarray | None = None
         self.n_prior_frames = 0
 
     def reset(
@@ -135,6 +144,8 @@ class RobotTwinSequenceInferenceState:
         self.pose_history.fill(0.0)
         self.anchor_pose_16d.fill(0.0)
         self.action_history.zero_()
+        self.prev_action_preds = None
+        self.prev_executed_absolute_action_16d = None
         self.n_prior_frames = 0
 
     def _encode_prompt(self, prompt: str):
@@ -185,7 +196,7 @@ class RobotTwinSequenceInferenceState:
         full_action = self.action_adapter.compact_to_full_action(compact_action)
         return self.action_adapter.normalize(full_action).astype(np.float32)
 
-    def _rebase_action_history_after_roll(self) -> None:
+    def _rebase_action_history_after_roll_legacy(self) -> None:
         if self.seq_len <= 1:
             return
         reference_action = self.action_history[0, 0].detach().cpu().numpy()
@@ -199,6 +210,144 @@ class RobotTwinSequenceInferenceState:
             dtype=torch.float32,
         )
         self.action_history[0, -1].zero_()
+
+    def _rebase_action_history_after_roll(
+        self,
+        previous_anchor_pose_16d: np.ndarray,
+        new_anchor_pose_16d: np.ndarray,
+    ) -> None:
+        if self.seq_len <= 1:
+            return
+        history_to_rebase = self.action_history[0, : self.seq_len - 1].detach().cpu().numpy()
+        rebased_history = self.action_adapter.rebase_normalized_actions_to_observed_anchor(
+            normalized_actions=history_to_rebase,
+            previous_anchor_pose_16d=previous_anchor_pose_16d,
+            new_anchor_pose_16d=new_anchor_pose_16d,
+        )
+        self.action_history[0, : self.seq_len - 1] = torch.from_numpy(rebased_history).to(
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.action_history[0, -1].zero_()
+
+    def _roll_warm_start_predictions(
+        self,
+        previous_anchor_pose_16d: np.ndarray,
+        new_anchor_pose_16d: np.ndarray,
+    ) -> None:
+        if self.prev_action_preds is None:
+            return
+
+        shifted_preds = torch.empty_like(self.prev_action_preds)
+        shifted_preds[:, :-1] = self.prev_action_preds[:, 1:]
+        shifted_preds[:, -1] = self.prev_action_preds[:, -1]
+        rebased_preds = self.action_adapter.rebase_normalized_actions_to_observed_anchor(
+            normalized_actions=shifted_preds[0].detach().cpu().numpy(),
+            previous_anchor_pose_16d=previous_anchor_pose_16d,
+            new_anchor_pose_16d=new_anchor_pose_16d,
+        )
+        self.prev_action_preds = torch.from_numpy(rebased_preds).to(
+            device=self.device,
+            dtype=torch.float32,
+        ).unsqueeze(0)
+
+    def _build_warm_start_sample(self) -> torch.Tensor | None:
+        if self.prev_action_preds is None or self.warm_start_blend <= 0.0:
+            return None
+
+        warm_start = self.prev_action_preds.detach().clone()
+        if self.warm_start_blend < 1.0:
+            warm_start = (
+                self.warm_start_blend * warm_start
+                + (1.0 - self.warm_start_blend) * torch.randn_like(warm_start)
+            )
+        if self.warm_start_noise_std > 0.0:
+            warm_start = warm_start + (
+                self.warm_start_noise_std * torch.randn_like(warm_start)
+            )
+        return warm_start
+
+    def _stabilize_normalized_action(
+        self,
+        normalized_action: torch.Tensor,
+        anchor_pose_16d: np.ndarray,
+        current_pose_16d: np.ndarray,
+    ) -> np.ndarray:
+        normalized_action_np = normalized_action.detach().cpu().numpy().astype(np.float32)
+        if not np.all(np.isfinite(normalized_action_np)):
+            LOGGER.warning(
+                "Policy produced non-finite normalized action values; replacing them with zeros before denormalization."
+            )
+            normalized_action_np = np.nan_to_num(
+                normalized_action_np,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+
+        full_action = self.action_adapter.denormalize(normalized_action_np)
+        compact_action = self.action_adapter.to_compact_execution_action(full_action)
+        fallback_compact_action = absolute_to_relative_compact_action(
+            current_pose_16d,
+            anchor_pose_16d,
+        )
+        compact_action, action_was_sanitized = sanitize_compact_pose_16d(
+            compact_action,
+            fallback_pose_16d=fallback_compact_action,
+        )
+        if action_was_sanitized:
+            LOGGER.warning(
+                "Policy produced an invalid compact action; falling back to a sanitized action anchored at the current observed pose."
+            )
+            full_action = self.action_adapter.compact_to_full_action(
+                compact_action,
+                template_action=full_action,
+            )
+            normalized_action_np = self.action_adapter.normalize(full_action).astype(np.float32)
+
+        absolute_compact_action = compose_compact_relative_action(
+            compact_action,
+            anchor_pose_16d,
+        )
+        absolute_compact_action, absolute_action_was_sanitized = sanitize_compact_pose_16d(
+            absolute_compact_action,
+            fallback_pose_16d=current_pose_16d,
+        )
+        if absolute_action_was_sanitized:
+            LOGGER.warning(
+                "Sanitized invalid absolute RoboTwin action after relative-to-absolute composition."
+            )
+            compact_action = absolute_to_relative_compact_action(
+                absolute_compact_action,
+                anchor_pose_16d,
+            )
+            full_action = self.action_adapter.compact_to_full_action(
+                compact_action,
+                template_action=full_action,
+            )
+            normalized_action_np = self.action_adapter.normalize(full_action).astype(np.float32)
+
+        if (
+            self.prev_executed_absolute_action_16d is not None
+            and self.action_smoothing_alpha > 0.0
+        ):
+            absolute_compact_action = smooth_absolute_compact_action(
+                self.prev_executed_absolute_action_16d,
+                absolute_compact_action,
+                self.action_smoothing_alpha,
+            )
+            compact_action = absolute_to_relative_compact_action(
+                absolute_compact_action,
+                anchor_pose_16d,
+            )
+            full_action = self.action_adapter.compact_to_full_action(
+                compact_action,
+                template_action=full_action,
+            )
+            normalized_action_np = self.action_adapter.normalize(full_action).astype(np.float32)
+
+        self.prev_executed_absolute_action_16d = absolute_compact_action.astype(np.float32)
+        return normalized_action_np
 
     def step(
         self,
@@ -228,7 +377,18 @@ class RobotTwinSequenceInferenceState:
             self.frame_history[0, -1] = frame
             self.pose_history[-1] = current_pose_16d
             self.action_history[0, -1].zero_()
-            self._rebase_action_history_after_roll()
+            if self.legacy_inference:
+                self._rebase_action_history_after_roll_legacy()
+            else:
+                previous_anchor_pose_16d = self.pose_history[0].copy()
+                self._rebase_action_history_after_roll(
+                    previous_anchor_pose_16d=previous_anchor_pose_16d,
+                    new_anchor_pose_16d=self.pose_history[0],
+                )
+                self._roll_warm_start_predictions(
+                    previous_anchor_pose_16d=previous_anchor_pose_16d,
+                    new_anchor_pose_16d=self.pose_history[0],
+                )
             frame_index = self.seq_len - 1
 
         self.anchor_pose_16d = self.pose_history[0].copy()
@@ -239,14 +399,18 @@ class RobotTwinSequenceInferenceState:
                 device=self.device,
                 dtype=torch.float32,
             )
+            if not self.legacy_inference:
+                self.prev_executed_absolute_action_16d = current_pose_16d.copy()
             return normalized_action, self.anchor_pose_16d.copy()
 
         with torch.inference_mode():
+            initial_sample = None if self.legacy_inference else self._build_warm_start_sample()
             try:
                 action_preds = self.model.online_full_predict(
                     frames=self.frame_history,
                     actions=self.action_history,
                     text_tokens_embed=self.text_tokens_embed,
+                    initial_sample=initial_sample,
                     compile=self.compile,
                 )
             except torch.OutOfMemoryError:
@@ -261,11 +425,41 @@ class RobotTwinSequenceInferenceState:
                     frames=self.frame_history,
                     actions=self.action_history,
                     text_tokens_embed=self.text_tokens_embed,
+                    initial_sample=initial_sample,
                     compile=False,
                 )
         action = action_preds[0, frame_index].detach().to(torch.float32)
-        self.action_history[0, frame_index] = action
-        return action.cpu().numpy(), self.anchor_pose_16d.copy()
+        if self.legacy_inference:
+            self.action_history[0, frame_index] = action
+            return action.cpu().numpy(), self.anchor_pose_16d.copy()
+
+        if not torch.isfinite(action_preds).all():
+            invalid_count = int((~torch.isfinite(action_preds)).sum().item())
+            LOGGER.warning(
+                "Policy predicted %d non-finite action values; replacing them with zeros before stabilization and warm start.",
+                invalid_count,
+            )
+            action_preds = torch.nan_to_num(
+                action_preds,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            action = action_preds[0, frame_index].detach().to(torch.float32)
+        stabilized_action = self._stabilize_normalized_action(
+            action,
+            self.anchor_pose_16d,
+            current_pose_16d,
+        )
+        stabilized_action_tensor = torch.from_numpy(stabilized_action).to(
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.action_history[0, frame_index] = stabilized_action_tensor
+        with torch.inference_mode():
+            self.prev_action_preds = action_preds.detach().to(torch.float32)
+            self.prev_action_preds[0, frame_index] = stabilized_action_tensor
+        return stabilized_action, self.anchor_pose_16d.copy()
 
 
 class OpenP2PRobotTwinPolicy:
@@ -275,6 +469,10 @@ class OpenP2PRobotTwinPolicy:
         checkpoint_path: str,
         device: torch.device,
         compile_model: bool,
+        legacy_inference: bool,
+        warm_start_blend: float,
+        warm_start_noise_std: float,
+        action_smoothing_alpha: float,
     ) -> None:
         self.config = config
         self.device = device
@@ -334,6 +532,10 @@ class OpenP2PRobotTwinPolicy:
             compile=compile_model and device.type == "cuda",
             text_tokenizer=self.text_tokenizer,
             action_adapter=self.action_adapter,
+            legacy_inference=legacy_inference,
+            warm_start_blend=float(max(0.0, min(1.0, warm_start_blend))),
+            warm_start_noise_std=float(max(0.0, warm_start_noise_std)),
+            action_smoothing_alpha=float(max(0.0, min(1.0, action_smoothing_alpha))),
         )
         self.state.reset("")
 
@@ -353,6 +555,10 @@ class OpenP2PRobotTwinPolicy:
                 self.config.shared.text_tokenizer_config.text_embedding_shape
             ),
             "text_tokenizer_available": self.text_tokenizer is not None,
+            "legacy_inference": self.state.legacy_inference,
+            "warm_start_blend": self.state.warm_start_blend,
+            "warm_start_noise_std": self.state.warm_start_noise_std,
+            "action_smoothing_alpha": self.state.action_smoothing_alpha,
             **self.observation_adapter.describe(),
         }
 
@@ -432,6 +638,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None, help="Torch device, for example cuda:0.")
     parser.add_argument("--no-compile", action="store_true", help="Disable torch.compile during online inference.")
     parser.add_argument("--skip-warmup", action="store_true", help="Skip one dummy warmup request before serving.")
+    parser.add_argument(
+        "--legacy-inference",
+        action="store_true",
+        help="Restore the earlier RoboTwin evaluation path without observed-pose rebasing, warm-started diffusion sampling, action sanitization, or output smoothing.",
+    )
+    parser.add_argument(
+        "--warm-start-blend",
+        type=float,
+        default=0.85,
+        help="Blend factor for initializing the next denoising pass from the previous predicted action sequence. Set to 0 to disable warm start.",
+    )
+    parser.add_argument(
+        "--warm-start-noise-std",
+        type=float,
+        default=0.03,
+        help="Extra Gaussian noise added on top of the warm-started action sequence.",
+    )
+    parser.add_argument(
+        "--action-smoothing-alpha",
+        type=float,
+        default=0.35,
+        help="EMA factor for smoothing executed absolute 16D actions. Set to 1 to disable smoothing and use the current action directly.",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -452,6 +681,10 @@ def main() -> None:
         checkpoint_path=checkpoint_path,
         device=device,
         compile_model=not args.no_compile,
+        legacy_inference=args.legacy_inference,
+        warm_start_blend=args.warm_start_blend,
+        warm_start_noise_std=args.warm_start_noise_std,
+        action_smoothing_alpha=args.action_smoothing_alpha,
     )
     if not args.skip_warmup:
         LOGGER.info("Running one warmup request before serving.")
