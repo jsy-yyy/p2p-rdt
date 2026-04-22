@@ -272,11 +272,12 @@ def _adapt_origin_tensor_to_target(
             f"repeat_img_tokens_x{repeat_factor}",
         )
 
-    adapted = _reshape_tensor_with_repeat(source_tensor, tuple(target_tensor.shape))
-    if source_tensor.numel() == target_tensor.numel():
-        return adapted.to(dtype=target_tensor.dtype), "reshape"
-    return adapted.to(dtype=target_tensor.dtype), "reshape_repeat"
-
+    raise ValueError(
+        "Cannot adapt origin checkpoint tensor "
+        f"{source_key} with shape {tuple(source_tensor.shape)} to "
+        f"{target_key} with shape {tuple(target_tensor.shape)}. "
+        "Only exact-shape loads and explicit whitelist adaptations are allowed."
+    )
 
 
 def _load_origin_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tensor]:
