@@ -371,6 +371,9 @@ class RobotTwinSequenceInferenceState:
             self.pose_history[frame_index] = current_pose_16d
             self.n_prior_frames += 1
         else:
+            previous_anchor_pose_16d = None
+            if not self.legacy_inference:
+                previous_anchor_pose_16d = self.pose_history[0].copy()
             self.frame_history = torch.roll(self.frame_history, shifts=-1, dims=1)
             self.action_history = torch.roll(self.action_history, shifts=-1, dims=1)
             self.pose_history = np.roll(self.pose_history, shift=-1, axis=0)
@@ -380,14 +383,14 @@ class RobotTwinSequenceInferenceState:
             if self.legacy_inference:
                 self._rebase_action_history_after_roll_legacy()
             else:
-                previous_anchor_pose_16d = self.pose_history[0].copy()
+                new_anchor_pose_16d = self.pose_history[0].copy()
                 self._rebase_action_history_after_roll(
                     previous_anchor_pose_16d=previous_anchor_pose_16d,
-                    new_anchor_pose_16d=self.pose_history[0],
+                    new_anchor_pose_16d=new_anchor_pose_16d,
                 )
                 self._roll_warm_start_predictions(
                     previous_anchor_pose_16d=previous_anchor_pose_16d,
-                    new_anchor_pose_16d=self.pose_history[0],
+                    new_anchor_pose_16d=new_anchor_pose_16d,
                 )
             frame_index = self.seq_len - 1
 
