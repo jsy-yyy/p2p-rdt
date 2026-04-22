@@ -39,6 +39,12 @@ def lightning_main():
         default=None,
         help="Checkpoint file or directory to resume stage3 training from.",
     )
+    parser.add_argument(
+        "--init_from_origin_ckpt",
+        type=str,
+        default=None,
+        help="Checkpoint file or directory from /data/jsy/open-p2p_origin used for partial initialization before training.",
+    )
     args = parser.parse_args()
 
     _maybe_reexec_with_filtered_gpus()
@@ -57,6 +63,10 @@ def lightning_main():
     if args.resume_from_ckpt is not None:
         logging.info(f"Using resume checkpoint: {args.resume_from_ckpt}")
         config.stage3_finetune.init.stage3_model_path = args.resume_from_ckpt
+
+    if args.init_from_origin_ckpt is not None:
+        logging.info(f"Using origin initialization checkpoint: {args.init_from_origin_ckpt}")
+        config.stage3_finetune.init.origin_model_path = args.init_from_origin_ckpt
 
     if args.fast_dev_run:
         logging.warning("!!!Fast dev run is enabled!!!")

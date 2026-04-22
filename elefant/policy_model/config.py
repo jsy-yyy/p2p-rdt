@@ -175,6 +175,10 @@ class Stage3InitConfig(ConfigBase):
         default=None,
         description="If loading checkpoints from a different path from the output path this is set. It should point directly at a checkpoint file, not a folder.",
     )
+    origin_model_path: Optional[str] = pydantic.Field(
+        default=None,
+        description="Optional origin-repo checkpoint used only for partial initialization of compatible policy transformer weights before training starts.",
+    )
 
 
 class PolicyTrainingConfig(ConfigBase):

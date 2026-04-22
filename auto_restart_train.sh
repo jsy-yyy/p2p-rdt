@@ -3,14 +3,14 @@ set -u
 set -o pipefail
 
 SESSION_NAME="policy_train"
-LOG_FILE="train_multiview_noise_action_cond_wo_state_cond_new_with_state_cond.log"
+LOG_FILE="train_adjust_bottle_multiview_cond_new_wo_stat_init_from_pretrain_nofreeze.log"
 CUDA_DEVICES="2,3,4,5,7"
 
 PYTHON_BIN="./.venv/bin/python"
 TRAIN_SCRIPT="elefant/policy_model/train.py"
 CONFIG_FILE="config/policy_model/150M_lerobot_rdt.yaml"
 
-CKPT_DIR="/data/jsy/open-p2p/train_out/150M_lerobot_rdt_multiview_noised_action_cond_new_with_stat_cond/stage3_finetune"
+CKPT_DIR="/data/jsy/open-p2p/train_out/150M_lerobot_rdt_adjust_bottle_multiview_cond_new_wo_stat_init_from_pretrain_nofreeze/stage3_finetune"
 
 RESTART_WAIT=20
 

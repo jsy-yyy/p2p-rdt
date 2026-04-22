@@ -16,3 +16,4 @@ train_out
 *.log
 eval_result/
 .venv
+checkpoints/

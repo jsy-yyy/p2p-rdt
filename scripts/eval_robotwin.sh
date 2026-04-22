@@ -10,10 +10,13 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-29056}"
 ROBOTWIN_ROOT="${ROBOTWIN_ROOT:-/data/jsy/RoboTwin}"
 ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-/home/zmz/miniconda3/envs/RoboTwin/bin/python}"
-CKPT_TAG="${CKPT_TAG:-150M_lerobot_rdt_camera_high_wo_state}"
+CKPT_TAG="${CKPT_TAG:-150M_lerobot_rdt_multiview_wo_state_init_from_pretrain}"
 OPEN_P2P_ROBOTWIN_DISABLE_OIDN="${OPEN_P2P_ROBOTWIN_DISABLE_OIDN:-1}"
 OPEN_P2P_ROBOTWIN_FORCE_RASTER="${OPEN_P2P_ROBOTWIN_FORCE_RASTER:-0}"
 export OPEN_P2P_ROBOTWIN_DISABLE_OIDN OPEN_P2P_ROBOTWIN_FORCE_RASTER
+
+# CKPT_TAG only affects the RoboTwin save directory name.
+# The actual served checkpoint comes from scripts/launch_robotwin_server.sh.
 
 if [ ! -x "$ROBOTWIN_PYTHON" ]; then
   echo "RoboTwin Python not found: $ROBOTWIN_PYTHON" >&2

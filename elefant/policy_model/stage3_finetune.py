@@ -152,8 +152,7 @@ def _validate_resume_checkpoint_compatibility(
             f'config expects image_condition={expected_image_condition}.'
         )
 
-def _resolve_resume_checkpoint_path(config: LightningPolicyConfig) -> Optional[str]:
-    checkpoint_path = config.stage3_finetune.init.stage3_model_path
+def _resolve_optional_checkpoint_path(checkpoint_path: Optional[str]) -> Optional[str]:
     if not checkpoint_path:
         return None
 
@@ -177,6 +176,214 @@ def _resolve_resume_checkpoint_path(config: LightningPolicyConfig) -> Optional[s
         return sorted(checkpoint_candidates)[-1]
 
     raise FileNotFoundError(f"Checkpoint path does not exist: {checkpoint_path}")
+
+
+def _resolve_resume_checkpoint_path(config: LightningPolicyConfig) -> Optional[str]:
+    return _resolve_optional_checkpoint_path(config.stage3_finetune.init.stage3_model_path)
+
+
+def _resolve_origin_init_checkpoint_path(
+    config: LightningPolicyConfig,
+) -> Optional[str]:
+    return _resolve_optional_checkpoint_path(config.stage3_finetune.init.origin_model_path)
+
+
+_ORIGIN_INIT_SKIP_PREFIXES = (
+    "bc_transformer.action_decoder.",
+    "key_action_embedding.",
+    "mouse_button_embedding.",
+    "mouse_delta_x_embedding.",
+    "mouse_delta_y_embedding.",
+    "keyboard_out_logits.",
+    "mouse_button_out_logits.",
+    "mouse_delta_x_out_logits.",
+    "mouse_delta_y_out_logits.",
+)
+
+_ORIGIN_INIT_SKIP_KEYS = {
+    "bc_transformer.action_pos_tokens",
+}
+
+_ORIGIN_TOKENIZER_PREFIX_REMAPS = (
+    ("bc_transformer.image_tokenizer.", "bc_transformer.image_tokenizer.base_tokenizer."),
+    ("image_tokenizer.", "image_tokenizer.base_tokenizer."),
+)
+
+
+def _should_skip_origin_init_key(key: str) -> bool:
+    return key in _ORIGIN_INIT_SKIP_KEYS or key.startswith(_ORIGIN_INIT_SKIP_PREFIXES)
+
+
+
+def _remap_origin_init_key(
+    key: str, config: LightningPolicyConfig
+) -> str:
+    if config.stage3_finetune.training_dataset.multi_view_image_mode != "token_concat":
+        return key
+
+    for source_prefix, target_prefix in _ORIGIN_TOKENIZER_PREFIX_REMAPS:
+        if key.startswith(source_prefix):
+            return target_prefix + key[len(source_prefix) :]
+    return key
+
+
+
+def _reshape_tensor_with_repeat(
+    source_tensor: torch.Tensor, target_shape: tuple[int, ...]
+) -> torch.Tensor:
+    flat_source = source_tensor.reshape(-1)
+    target_numel = 1
+    for dim in target_shape:
+        target_numel *= dim
+
+    if flat_source.numel() == 0:
+        raise ValueError("Cannot adapt an empty tensor to a non-empty target shape.")
+
+    if flat_source.numel() == target_numel:
+        return flat_source.reshape(target_shape)
+
+    repeats = (target_numel + flat_source.numel() - 1) // flat_source.numel()
+    flat_source = flat_source.repeat(repeats)[:target_numel]
+    return flat_source.reshape(target_shape)
+
+
+
+def _adapt_origin_tensor_to_target(
+    source_key: str,
+    source_tensor: torch.Tensor,
+    target_key: str,
+    target_tensor: torch.Tensor,
+) -> tuple[torch.Tensor, str]:
+    if tuple(source_tensor.shape) == tuple(target_tensor.shape):
+        return source_tensor.to(dtype=target_tensor.dtype), "direct"
+
+    if (
+        source_key.endswith("img_pos_tokens")
+        and target_key.endswith("img_pos_tokens")
+        and source_tensor.ndim == 3
+        and target_tensor.ndim == 3
+        and source_tensor.shape[0] == target_tensor.shape[0]
+        and source_tensor.shape[2] == target_tensor.shape[2]
+        and target_tensor.shape[1] % source_tensor.shape[1] == 0
+    ):
+        repeat_factor = target_tensor.shape[1] // source_tensor.shape[1]
+        return (
+            source_tensor.repeat(1, repeat_factor, 1).to(dtype=target_tensor.dtype),
+            f"repeat_img_tokens_x{repeat_factor}",
+        )
+
+    raise ValueError(
+        "Cannot adapt origin checkpoint tensor "
+        f"{source_key} with shape {tuple(source_tensor.shape)} to "
+        f"{target_key} with shape {tuple(target_tensor.shape)}. "
+        "Only exact-shape loads and explicit whitelist adaptations are allowed."
+    )
+
+
+def _load_origin_checkpoint_state_dict(checkpoint_path: str) -> dict[str, torch.Tensor]:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if isinstance(checkpoint, dict):
+        state_dict = checkpoint.get("state_dict")
+        if isinstance(state_dict, dict):
+            return state_dict
+        if all(isinstance(key, str) for key in checkpoint):
+            return checkpoint
+    raise ValueError(
+        f"Unsupported origin checkpoint format at {checkpoint_path}; expected a Lightning checkpoint or a plain state_dict."
+    )
+
+
+
+def _maybe_initialize_from_origin_checkpoint(
+    model: "Stage3LabelledBCLightning",
+    config: LightningPolicyConfig,
+) -> None:
+    origin_checkpoint_path = _resolve_origin_init_checkpoint_path(config)
+    if origin_checkpoint_path is None:
+        return
+
+    if config.stage3_finetune.init.stage3_model_path:
+        logging.warning(
+            "Skipping origin partial initialization because stage3_model_path is set; resume checkpoint loading takes precedence."
+        )
+        return
+
+    logging.warning(
+        "Initializing compatible weights from origin checkpoint: %s",
+        origin_checkpoint_path,
+    )
+    origin_state_dict = _load_origin_checkpoint_state_dict(origin_checkpoint_path)
+    target_state_dict = model.state_dict()
+    loadable_state_dict = {}
+
+    counts = {
+        "loaded": 0,
+        "adapted": 0,
+        "filtered": 0,
+        "missing": 0,
+        "remapped": 0,
+    }
+    adapted_examples: list[str] = []
+    filtered_examples: list[str] = []
+    missing_examples: list[str] = []
+
+    for source_key, source_tensor in origin_state_dict.items():
+        if _should_skip_origin_init_key(source_key):
+            counts["filtered"] += 1
+            if len(filtered_examples) < 8:
+                filtered_examples.append(source_key)
+            continue
+
+        target_key = _remap_origin_init_key(source_key, config)
+        if target_key != source_key:
+            counts["remapped"] += 1
+
+        target_tensor = target_state_dict.get(target_key)
+        if target_tensor is None:
+            counts["missing"] += 1
+            if len(missing_examples) < 8:
+                missing_examples.append(f"{source_key} -> {target_key}")
+            continue
+
+        adapted_tensor, adapt_mode = _adapt_origin_tensor_to_target(
+            source_key=source_key,
+            source_tensor=source_tensor,
+            target_key=target_key,
+            target_tensor=target_tensor,
+        )
+        loadable_state_dict[target_key] = adapted_tensor
+        counts["loaded"] += 1
+        if adapt_mode != "direct":
+            counts["adapted"] += 1
+            if len(adapted_examples) < 8:
+                adapted_examples.append(
+                    f"{source_key} -> {target_key} [{tuple(source_tensor.shape)} -> {tuple(target_tensor.shape)}; {adapt_mode}]"
+                )
+
+    if not loadable_state_dict:
+        logging.warning(
+            "Origin checkpoint %s did not provide any compatible weights after filtering/remapping.",
+            origin_checkpoint_path,
+        )
+        return
+
+    missing_keys, unexpected_keys = model.load_state_dict(loadable_state_dict, strict=False)
+    logging.warning(
+        "Origin partial init summary: loaded=%s adapted=%s remapped=%s filtered=%s missing_target=%s model_missing_after_load=%s unexpected_after_load=%s",
+        counts["loaded"],
+        counts["adapted"],
+        counts["remapped"],
+        counts["filtered"],
+        counts["missing"],
+        len(missing_keys),
+        len(unexpected_keys),
+    )
+    if adapted_examples:
+        logging.info("Origin init adapted examples: %s", adapted_examples)
+    if filtered_examples:
+        logging.info("Origin init filtered examples: %s", filtered_examples)
+    if missing_examples:
+        logging.info("Origin init missing-target examples: %s", missing_examples)
 
 
 def upload_model_config(checkpoint_path: str, config):
@@ -588,6 +795,7 @@ class PolicyModelTrainer(ModelFreePolicy):
         frames: torch.Tensor,
         actions: torch.Tensor,
         text_tokens_embed: Optional[torch.Tensor] = None,
+        initial_sample: Optional[torch.Tensor] = None,
         compile: bool = True,
     ) -> torch.Tensor:
         valid_step_mask = self._get_rdt_valid_step_mask(frames)
@@ -614,6 +822,7 @@ class PolicyModelTrainer(ModelFreePolicy):
             action_shape_source=actions,
             state_actions=actions,
             valid_step_mask=valid_step_mask,
+            initial_sample=initial_sample,
             compile=compile,
         )
         eager_assert(action_preds.shape, (B, T, self.n_actions))
@@ -639,6 +848,7 @@ class PolicyModelTrainer(ModelFreePolicy):
         kv_cache_state: List[KVCacheState] = None,
         sampling_temperature: float = 1.0,
         text_tokens_embed: Optional[torch.Tensor] = None,
+        initial_sample: Optional[torch.Tensor] = None,
         compile: bool = True,
     ) -> torch.Tensor:
         del kv_cache_state, sampling_temperature
@@ -647,6 +857,7 @@ class PolicyModelTrainer(ModelFreePolicy):
                 frames=frames,
                 actions=actions,
                 text_tokens_embed=text_tokens_embed,
+                initial_sample=initial_sample,
                 compile=compile,
             )
 
@@ -864,10 +1075,18 @@ class PolicyModelTrainer(ModelFreePolicy):
         action_shape_source: torch.Tensor,
         state_actions: torch.Tensor,
         valid_step_mask: torch.Tensor,
+        initial_sample: Optional[torch.Tensor] = None,
         compile: bool = True,
     ) -> torch.Tensor:
         del compile
-        sample = torch.randn_like(action_shape_source)
+        if initial_sample is None:
+            sample = torch.randn_like(action_shape_source)
+        else:
+            eager_assert(initial_sample.shape, action_shape_source.shape)
+            sample = initial_sample.to(
+                device=action_shape_source.device,
+                dtype=action_shape_source.dtype,
+            ).clone()
         scheduler = self.rdt_inference_scheduler
         timesteps = scheduler.timesteps.to(action_shape_source.device)
         for step_idx, timestep in enumerate(timesteps):
@@ -901,6 +1120,7 @@ class PolicyModelTrainer(ModelFreePolicy):
         action_shape_source: torch.Tensor,
         state_actions: Optional[torch.Tensor] = None,
         valid_step_mask: Optional[torch.Tensor] = None,
+        initial_sample: Optional[torch.Tensor] = None,
         compile: bool = True,
     ) -> torch.Tensor:
         if state_actions is None:
@@ -918,6 +1138,7 @@ class PolicyModelTrainer(ModelFreePolicy):
             action_shape_source=action_shape_source,
             state_actions=state_actions,
             valid_step_mask=valid_step_mask,
+            initial_sample=initial_sample,
             compile=compile,
         )
 
@@ -1450,6 +1671,7 @@ def _init_stage3_model(config: LightningPolicyConfig) -> Stage3LabelledBCLightni
         "stage2_model_path is not allowed when initializing with random weights"
     )
     model = Stage3LabelledBCLightning(config)
+    _maybe_initialize_from_origin_checkpoint(model, config)
 
     return model
 
@@ -1743,7 +1965,7 @@ def _select_training_gpus() -> tuple[str, int | str]:
         )
         return "auto", "auto"
 
-    if len(free_gpu_indices) == len(gpu_rows):
+    if len(free_gpu_indices) == len(inventory):
         return "gpu", len(free_gpu_indices)
 
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"

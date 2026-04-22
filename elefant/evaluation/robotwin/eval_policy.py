@@ -37,6 +37,18 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        LOGGER.warning("Invalid integer env %s=%r; using default %s.", name, value, default)
+        return default
+    return max(parsed, 1)
+
+
 def _configure_robowin_rendering() -> None:
     disable_oidn = _env_flag("OPEN_P2P_ROBOTWIN_DISABLE_OIDN", default=True)
     force_raster = _env_flag("OPEN_P2P_ROBOTWIN_FORCE_RASTER", default=False)
@@ -435,6 +447,91 @@ def _close_eval_video_ffmpeg(ffmpeg: subprocess.Popen | None) -> None:
         LOGGER.warning("Eval video ffmpeg exited with non-zero return code %s.", return_code)
 
 
+def _snapshot_task_env_observation(task_env: Any) -> dict[str, Any]:
+    task_env.cameras.update_picture()
+    observation_block = task_env.cameras.get_config()
+    rgb = task_env.cameras.get_rgb()
+    for camera_name, camera_rgb in rgb.items():
+        camera_entry = observation_block.setdefault(camera_name, {})
+        if isinstance(camera_entry, dict):
+            camera_entry.update(camera_rgb)
+        else:
+            observation_block[camera_name] = dict(camera_rgb)
+    return {"observation": observation_block}
+
+
+def _estimate_endpose_motion(previous_pose_16d: np.ndarray, current_pose_16d: np.ndarray) -> float:
+    previous_pose_16d = np.asarray(previous_pose_16d, dtype=np.float32).reshape(16)
+    current_pose_16d = np.asarray(current_pose_16d, dtype=np.float32).reshape(16)
+    left_translation = float(np.linalg.norm(current_pose_16d[:3] - previous_pose_16d[:3]))
+    right_translation = float(np.linalg.norm(current_pose_16d[8:11] - previous_pose_16d[8:11]))
+    left_gripper = float(abs(current_pose_16d[7] - previous_pose_16d[7]))
+    right_gripper = float(abs(current_pose_16d[15] - previous_pose_16d[15]))
+    return max(left_translation, right_translation, left_gripper, right_gripper)
+
+
+class _EvalVideoRecorder:
+    def __init__(self, output_path: Path, action_render_stride: int) -> None:
+        self.output_path = output_path
+        self.action_render_stride = max(int(action_render_stride), 1)
+        self.ffmpeg: subprocess.Popen | None = None
+        self.disabled = False
+        self._action_active = False
+        self._action_render_count = 0
+        self._restore_env: Any = None
+
+    def install_on_env(self, task_env: Any) -> None:
+        original_update_render = task_env._update_render
+
+        def _wrapped_update_render(*args, **kwargs):
+            result = original_update_render(*args, **kwargs)
+            if self._action_active and not self.disabled:
+                self._action_render_count += 1
+                if self._action_render_count % self.action_render_stride == 0:
+                    self.record_observation(_snapshot_task_env_observation(task_env))
+            return result
+
+        task_env._update_render = _wrapped_update_render
+        self._restore_env = lambda: setattr(task_env, "_update_render", original_update_render)
+
+    def uninstall_from_env(self) -> None:
+        if self._restore_env is not None:
+            self._restore_env()
+            self._restore_env = None
+
+    def begin_action(self) -> None:
+        self._action_active = True
+        self._action_render_count = 0
+
+    def end_action(self) -> None:
+        self._action_active = False
+
+    def record_observation(self, observation: dict[str, Any]) -> None:
+        if self.disabled:
+            return
+
+        try:
+            frame = _compose_eval_video_frame(observation)
+            if self.ffmpeg is None:
+                self.ffmpeg = _start_eval_video_ffmpeg(self.output_path, frame)
+            _write_eval_video_frame(self.ffmpeg, frame)
+        except Exception as exc:
+            LOGGER.warning(
+                "Disabling eval video recording for %s after frame export failure: %s",
+                self.output_path,
+                exc,
+            )
+            self.disabled = True
+            _close_eval_video_ffmpeg(self.ffmpeg)
+            self.ffmpeg = None
+
+    def close(self) -> None:
+        self.end_action()
+        self.uninstall_from_env()
+        _close_eval_video_ffmpeg(self.ffmpeg)
+        self.ffmpeg = None
+
+
 def _get_embodiment_config(robot_file: str) -> dict[str, Any]:
     with open(Path(robot_file) / "config.yml", "r", encoding="utf-8") as file:
         return yaml.load(file.read(), Loader=yaml.FullLoader)
@@ -648,28 +745,25 @@ def _eval_remote_policy(user_cfg: dict[str, Any]) -> None:
         model.reset(prompt=instruction)
 
         eval_video_path = save_dir / f"episode{task_env.test_num}.mp4" if args["eval_video_log"] else None
-        eval_video_ffmpeg: subprocess.Popen | None = None
-        eval_video_disabled = False
+        eval_video_recorder = (
+            _EvalVideoRecorder(
+                output_path=eval_video_path,
+                action_render_stride=_env_int("OPEN_P2P_ROBOTWIN_EVAL_VIDEO_ACTION_RENDER_STRIDE", 10),
+            )
+            if eval_video_path is not None
+            else None
+        )
 
+        if eval_video_recorder is not None:
+            eval_video_recorder.install_on_env(task_env)
+
+        observation = task_env.get_obs()
+        stalled_action_streak = 0
         succ = False
         try:
             while task_env.take_action_cnt < task_env.step_lim:
-                observation = task_env.get_obs()
-                if eval_video_path is not None and not eval_video_disabled:
-                    try:
-                        eval_frame = _compose_eval_video_frame(observation)
-                        if eval_video_ffmpeg is None:
-                            eval_video_ffmpeg = _start_eval_video_ffmpeg(eval_video_path, eval_frame)
-                        _write_eval_video_frame(eval_video_ffmpeg, eval_frame)
-                    except Exception as exc:
-                        LOGGER.warning(
-                            "Disabling eval video recording for episode %s after frame export failure: %s",
-                            task_env.test_num,
-                            exc,
-                        )
-                        eval_video_disabled = True
-                        _close_eval_video_ffmpeg(eval_video_ffmpeg)
-                        eval_video_ffmpeg = None
+                if eval_video_recorder is not None:
+                    eval_video_recorder.record_observation(observation)
 
                 current_pose_16d = _extract_current_pose_16d(observation)
                 payload = _format_obs(observation, instruction)
@@ -690,18 +784,39 @@ def _eval_remote_policy(user_cfg: dict[str, Any]) -> None:
                 if ee_action.size != 16:
                     raise ValueError(f"Expected 16-D absolute ee action, got shape {ee_action.shape}.")
 
-                task_env.take_action(ee_action, action_type="ee")
+                if eval_video_recorder is not None:
+                    eval_video_recorder.begin_action()
+                try:
+                    task_env.take_action(ee_action, action_type="ee")
+                finally:
+                    if eval_video_recorder is not None:
+                        eval_video_recorder.end_action()
+
+                observation = task_env.get_obs()
+                next_pose_16d = _extract_current_pose_16d(observation)
+                motion_delta = _estimate_endpose_motion(current_pose_16d, next_pose_16d)
+                if motion_delta < 1e-4 and not task_env.eval_success:
+                    stalled_action_streak += 1
+                    if stalled_action_streak == 10 or stalled_action_streak % 25 == 0:
+                        LOGGER.warning(
+                            "Detected %s consecutive near-static eval actions at episode=%s step=%s (motion_delta=%.6f). "
+                            "This usually means the planner failed silently or the policy saturated to an almost identical target pose.",
+                            stalled_action_streak,
+                            task_env.test_num,
+                            task_env.take_action_cnt,
+                            motion_delta,
+                        )
+                else:
+                    stalled_action_streak = 0
+
                 if task_env.eval_success:
                     succ = True
-                    if eval_video_ffmpeg is not None and not eval_video_disabled:
-                        final_observation = task_env.get_obs()
-                        _write_eval_video_frame(
-                            eval_video_ffmpeg,
-                            _compose_eval_video_frame(final_observation),
-                        )
+                    if eval_video_recorder is not None:
+                        eval_video_recorder.record_observation(observation)
                     break
         finally:
-            _close_eval_video_ffmpeg(eval_video_ffmpeg)
+            if eval_video_recorder is not None:
+                eval_video_recorder.close()
 
         if succ:
             task_env.suc += 1
