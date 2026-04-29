@@ -58,6 +58,8 @@ class DatasetConfig(ConfigBase):
     single_task: Optional[str] = None
     multi_view_image_mode: Literal["vertical", "frame", "first", "token_concat"] = "vertical"
     text_embedding_shape: List[int] = pydantic.Field(default_factory=lambda: [1, 1])
+    text_tokenizer_config: Optional[TextTokenizerConfig] = None
+    prefer_raw_text_for_text_embeddings: bool = True
     robot_action_dim: Optional[int] = None
 
     def model_post_init(self, __context) -> None:

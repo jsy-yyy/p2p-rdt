@@ -7,8 +7,8 @@ set -euo pipefail
 # - warm start and smoothing explicitly disabled via zero-valued flags
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL_CONFIG="${1:-$ROOT_DIR/train_out/150M_lerobot_rdt_adjust_bottle_multiview_cond_new_wo_stat_init_from_pretrain/stage3_finetune/model_config.yaml}"
-CHECKPOINT="${2:-$ROOT_DIR/train_out/150M_lerobot_rdt_adjust_bottle_multiview_cond_new_wo_stat_init_from_pretrain/stage3_finetune/checkpoint-step=00020000.ckpt}"
+MODEL_CONFIG="${1:-$ROOT_DIR/train_out/wo_state_cond_origin_init/stage3_finetune/model_config.yaml}"
+CHECKPOINT="${2:-$ROOT_DIR/train_out/wo_state_cond_origin_init/stage3_finetune/checkpoint-step=00020000.ckpt}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-29056}"
 DEVICE="${DEVICE:-}"

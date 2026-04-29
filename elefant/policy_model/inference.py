@@ -18,7 +18,6 @@ import time
 import lightning as pl
 from torch.utils import _pytree as pytree
 from elefant.text_tokenizer.factory import get_text_tokenizer
-from elefant.text_tokenizer.config import TextTokenizerConfig
 from elefant.data.action_mapping import (
     UniversalAutoregressiveActionMapping,
     StructuredAction,
@@ -153,6 +152,60 @@ MODEL_INPUT_HEIGHT = 192
 MODEL_INPUT_WIDTH = 192
 
 
+def _init_text_tokenizer_from_model(model: Stage3LabelledBCLightning):
+    text_tokenizer_config = getattr(model.config.shared, "text_tokenizer_config", None)
+    text_tokenizer_name = getattr(text_tokenizer_config, "text_tokenizer_name", None)
+    if text_tokenizer_name is None:
+        return None
+    print(f"text_tokenizer_name is not None: {text_tokenizer_name}")
+    return get_text_tokenizer(text_tokenizer_config)
+
+
+def _build_zero_text_tokens_embed(
+    text_tokenizer_model,
+    *,
+    text_embedding_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if text_tokenizer_model is not None:
+        return torch.zeros(
+            size=(
+                text_tokenizer_model.get_n_text_tokens(),
+                text_tokenizer_model.get_text_embed_dim(),
+            ),
+            device=device,
+            dtype=dtype,
+        )
+    return torch.zeros(
+        size=(1, text_embedding_dim),
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _encode_text_tokens_for_inference(
+    text_tokenizer_model,
+    text: Optional[str],
+    *,
+    text_embedding_dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if text_tokenizer_model is None or text is None:
+        return _build_zero_text_tokens_embed(
+            text_tokenizer_model,
+            text_embedding_dim=text_embedding_dim,
+            device=device,
+            dtype=dtype,
+        )
+
+    text_input = text_tokenizer_model.tokenize(text)
+    text_tokens_embed = text_tokenizer_model(**text_input)
+    assert len(text_tokens_embed.shape) == 4
+    return text_tokens_embed.squeeze(dim=(0, 1)).to(device=device, dtype=dtype)
+
+
 class BaseInferenceState(abc.ABC):
     """Abstract base class for inference state."""
 
@@ -200,13 +253,7 @@ class KVCacheInferenceState(BaseInferenceState):
         self.step_size = self.model.bc_transformer.step_size
         self.virtual_idx_cpu = 0
         self.text_tokenizer_model_name = self.model._get_text_tokenizer_name()
-        if self.text_tokenizer_model_name is not None:
-            print(f"text_tokenizer_name is not None: {self.text_tokenizer_model_name}")
-            self.text_tokenizer_model = get_text_tokenizer(
-                TextTokenizerConfig(text_tokenizer_name=self.text_tokenizer_model_name)
-            )
-        else:
-            self.text_tokenizer_model = None
+        self.text_tokenizer_model = _init_text_tokenizer_from_model(self.model)
         self.text_embedding_dim = self.model._get_text_embedding_dim()
         self.reset()
 
@@ -228,34 +275,13 @@ class KVCacheInferenceState(BaseInferenceState):
                 unif_rand_in = torch.rand(
                     size=(num_sampling_steps,), device=self.device
                 )
-            if self.text_tokenizer_model is not None and text is not None:
-                text_input = self.text_tokenizer_model.tokenize(text)
-                text_tokens_embed = self.text_tokenizer_model(**text_input)
-                assert len(text_tokens_embed.shape) == 4
-                # squeeze the batch and T dimension
-                text_tokens_embed = text_tokens_embed.squeeze(dim=(0, 1))
-            elif self.text_tokenizer_model is not None and text is None:
-                # Notice that this initial value needs to be the same as the
-                # default value in elefant/data/action_label_video_proto_dataset.py default value
-                text_tokens_embed = torch.zeros(
-                    size=(
-                        self.text_tokenizer_model.get_n_text_tokens(),
-                        self.text_tokenizer_model.get_text_embed_dim(),
-                    ),
-                    device=self.device,
-                    dtype=torch.bfloat16,
-                )
-            else:
-                # under this case the policy transformer will not take any text embedding
-                # so the input will be ignored
-                text_tokens_embed = torch.zeros(
-                    size=(
-                        1,
-                        self.text_embedding_dim,
-                    ),
-                    device=self.device,
-                    dtype=torch.bfloat16,
-                )
+            text_tokens_embed = _encode_text_tokens_for_inference(
+                self.text_tokenizer_model,
+                text,
+                text_embedding_dim=self.text_embedding_dim,
+                device=self.device,
+                dtype=torch.bfloat16,
+            )
             action_tensor, self.idx, self.kv_cache_state = (
                 self.model.online_kv_cache_predict(
                     frame,
@@ -323,11 +349,8 @@ class FullInferenceState(BaseInferenceState):
         self.action_history = collections.deque(maxlen=self.T)
         self.text_embedding_dim = self.model._get_text_embedding_dim()
         self.text_tokenizer_model_name = self.model._get_text_tokenizer_name()
-        if self.text_tokenizer_model_name is not None:
-            print(f"text_tokenizer_name is not None: {self.text_tokenizer_model_name}")
-            self.text_tokenizer_model = get_text_tokenizer(
-                TextTokenizerConfig(text_tokenizer_name=self.text_tokenizer_model_name)
-            )
+        self.text_tokenizer_model = _init_text_tokenizer_from_model(self.model)
+        if self.text_tokenizer_model is not None:
             self.text_tokens_embed = torch.zeros(
                 size=(
                     1,
@@ -372,9 +395,14 @@ class FullInferenceState(BaseInferenceState):
             # for this frame.
             self.frame_in[:, self.n_prior_frames, :, :, :] = frame
             if self.text_tokenizer_model is not None and text is not None:
-                text_input = self.text_tokenizer_model.tokenize(text)
                 self.text_tokens_embed[:, self.n_prior_frames, :, :] = (
-                    self.text_tokenizer_model(**text_input)
+                    _encode_text_tokens_for_inference(
+                        self.text_tokenizer_model,
+                        text,
+                        text_embedding_dim=self.text_embedding_dim,
+                        device=self.device,
+                        dtype=torch.bfloat16,
+                    ).unsqueeze(0)
                 )
             self.n_prior_frames += 1
         else:
@@ -386,20 +414,13 @@ class FullInferenceState(BaseInferenceState):
             # Put the new frame at the last position..
             self.frame_in[:, -1, :, :, :] = frame
             self.text_tokens_embed = torch.roll(self.text_tokens_embed, -1, dims=1)
-            if self.text_tokenizer_model is not None and text is not None:
-                text_input = self.text_tokenizer_model.tokenize(text)
-                self.text_tokens_embed[:, -1, :, :] = self.text_tokenizer_model(
-                    **text_input
-                )
-            else:
-                self.text_tokens_embed[:, -1, :, :] = torch.zeros(
-                    size=(
-                        1,
-                        self.text_embedding_dim,
-                    ),
-                    device=self.device,
-                    dtype=torch.bfloat16,
-                )
+            self.text_tokens_embed[:, -1, :, :] = _encode_text_tokens_for_inference(
+                self.text_tokenizer_model,
+                text,
+                text_embedding_dim=self.text_embedding_dim,
+                device=self.device,
+                dtype=torch.bfloat16,
+            ).unsqueeze(0)
             # The actions for this new frame will be set below when sampling.
 
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16):

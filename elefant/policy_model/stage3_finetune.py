@@ -23,6 +23,7 @@ from elefant.data import (
     StructuredAction,
 )
 from elefant.text_tokenizer.config import TextTokenizerConfig
+from elefant.text_tokenizer.factory import get_text_tokenizer
 from elefant.data.rand_augment import BatchRandAugment
 from elefant.policy_model.config import LightningPolicyConfig
 from elefant.policy_model.model_free import ModelFreePolicy
@@ -416,6 +417,49 @@ def _sample_from_distribution(
 
 
 def _sync_text_embedding_shape_with_dataset(config: LightningPolicyConfig):
+    prefer_raw_text = getattr(
+        config.stage3_finetune.training_dataset,
+        "prefer_raw_text_for_text_embeddings",
+        True,
+    )
+    if prefer_raw_text:
+        tokenizer_name = getattr(
+            config.shared.text_tokenizer_config, "text_tokenizer_name", None
+        )
+        if tokenizer_name is not None:
+            try:
+                text_tokenizer = get_text_tokenizer(config.shared.text_tokenizer_config)
+            except Exception as exc:
+                logging.warning(
+                    'Failed to initialize configured text tokenizer `%s` for raw-text shape inference; falling back to dataset text_emb shape inference. Error: %s',
+                    tokenizer_name,
+                    exc,
+                )
+            else:
+                inferred_shape = [
+                    text_tokenizer.get_n_text_tokens(),
+                    text_tokenizer.get_text_embed_dim(),
+                ]
+                current_shape = list(config.shared.text_tokenizer_config.text_embedding_shape)
+                if current_shape != inferred_shape:
+                    logging.warning(
+                        'Overriding text_embedding_shape from %s to %s based on configured raw-text tokenizer `%s`.',
+                        current_shape,
+                        inferred_shape,
+                        tokenizer_name,
+                    )
+                else:
+                    logging.info(
+                        'Using text_embedding_shape %s from configured raw-text tokenizer `%s`.',
+                        inferred_shape,
+                        tokenizer_name,
+                    )
+                config.shared.text_tokenizer_config.text_embedding_shape = inferred_shape
+                config.stage3_finetune.training_dataset.text_embedding_shape = inferred_shape
+                for val_dataset in config.stage3_finetune.validation_datasets:
+                    val_dataset.text_embedding_shape = inferred_shape
+                return
+
     _, infer_text_embedding_shape_from_dataset = _load_lerobot_dataset_support()
     inferred = infer_text_embedding_shape_from_dataset(
         config.stage3_finetune.training_dataset
@@ -425,6 +469,12 @@ def _sync_text_embedding_shape_with_dataset(config: LightningPolicyConfig):
 
     inferred_shape, sample_path = inferred
     current_shape = list(config.shared.text_tokenizer_config.text_embedding_shape)
+    tokenizer_name = getattr(
+        config.shared.text_tokenizer_config, 'text_tokenizer_name', None
+    )
+    tokenizer_model_name_or_path = getattr(
+        config.shared.text_tokenizer_config, 'model_name_or_path', None
+    )
     if current_shape != inferred_shape:
         logging.warning(
             'Overriding text_embedding_shape from %s to %s based on %s.',
@@ -432,6 +482,14 @@ def _sync_text_embedding_shape_with_dataset(config: LightningPolicyConfig):
             inferred_shape,
             sample_path,
         )
+        if tokenizer_name is not None:
+            logging.warning(
+                'Configured text tokenizer `%s` (%s) does not match dataset text embedding shape %s from %s; training will follow the dataset embeddings. Regenerate dataset text_emb/empty_emb if you want to switch tokenizer end-to-end.',
+                tokenizer_name,
+                tokenizer_model_name_or_path or 'default-model-source',
+                inferred_shape,
+                sample_path,
+            )
     else:
         logging.info(
             'Using text_embedding_shape %s inferred from %s.',
@@ -1697,9 +1755,14 @@ class SupervisedDataModule(pl.LightningDataModule):
         )
         self.text_tokenizer_config = TextTokenizerConfig(
             text_tokenizer_name=self.cfg.shared.text_tokenizer_config.text_tokenizer_name,
+            model_name_or_path=self.cfg.shared.text_tokenizer_config.model_name_or_path,
+            max_position_embeddings=self.cfg.shared.text_tokenizer_config.max_position_embeddings,
             text_embedding_shape=self.cfg.shared.text_tokenizer_config.text_embedding_shape,
             text_annotation_model_version=self.cfg.shared.text_tokenizer_config.text_annotation_model_version,
         )
+        self.training_dataset_cfg.text_tokenizer_config = self.text_tokenizer_config
+        for validation_dataset_cfg in self.validation_dataset_cfgs:
+            validation_dataset_cfg.text_tokenizer_config = self.text_tokenizer_config
 
     def _make_dataloader(self, dataset, dataset_cfg: DatasetConfig, shuffle: bool):
         dataloader_kwargs = dict(

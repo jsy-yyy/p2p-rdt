@@ -17,3 +17,5 @@ train_out
 eval_result/
 .venv
 checkpoints/
+plots/
+scripts/.codex_write_test
