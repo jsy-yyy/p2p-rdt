@@ -16,6 +16,8 @@ import pyarrow.parquet as pq
 
 import logging as logger
 from elefant.data.action_label_video_proto_dataset import ActionLabelVideoDatasetItem
+from elefant.text_tokenizer.config import TextTokenizerConfig
+from elefant.text_tokenizer.factory import get_text_tokenizer
 
 
 def _normalize_obs_cam_keys(obs_cam_keys):
@@ -113,6 +115,26 @@ def recursive_find_file(directory, filename='info.json'):
     except Exception as e:
         print(f"Error: {e}")
     return result
+
+_TEXT_TOKENIZER_CACHE = {}
+
+
+def _get_text_tokenizer_cache_key(config: TextTokenizerConfig) -> tuple[str | None, str | None, int | None]:
+    return (
+        config.text_tokenizer_name,
+        config.model_name_or_path,
+        config.max_position_embeddings,
+    )
+
+
+def _get_shared_text_tokenizer(config: TextTokenizerConfig):
+    cache_key = _get_text_tokenizer_cache_key(config)
+    tokenizer = _TEXT_TOKENIZER_CACHE.get(cache_key)
+    if tokenizer is None:
+        tokenizer = get_text_tokenizer(config)
+        _TEXT_TOKENIZER_CACHE[cache_key] = tokenizer
+    return tokenizer
+
 
 def construct_lerobot(
     repo_id,
@@ -275,6 +297,13 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
             )
         self.config = config
         self.cfg_prob = config.cfg_prob
+        self.text_tokenizer_config = getattr(config, 'text_tokenizer_config', None)
+        self.prefer_raw_text_for_text_embeddings = bool(
+            getattr(config, 'prefer_raw_text_for_text_embeddings', True)
+        )
+        self._text_embedding_cache = {}
+        self._empty_text_embedding = None
+        self._raw_text_warning_emitted = False
         self.used_video_keys = _normalize_obs_cam_keys(config.obs_cam_keys)
         self.used_action_channel_ids = list(getattr(config, 'used_action_channel_ids', []))
         self._empty_emb_shape_warning_emitted = False
@@ -429,13 +458,119 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
                 "frame_ids": torch.arange(start_frame, end_frame, dtype=torch.long),
                 "text_emb": latent_data.get("text_emb", None)
             }
-            if out[key].get("text_emb", None) is None:
-                raise ValueError("text_emb is missing.")
         return self._flatten_latent_dict(out)
     
         
+    def _get_text_tokenizer(self):
+        if self.text_tokenizer_config is None:
+            return None
+        tokenizer_name = getattr(self.text_tokenizer_config, 'text_tokenizer_name', None)
+        if tokenizer_name is None:
+            return None
+        return _get_shared_text_tokenizer(self.text_tokenizer_config)
+
+    def _resolve_raw_text(self, meta: dict) -> str | None:
+        action_text = str(meta.get('action_text', '') or '').strip()
+        if action_text:
+            return action_text
+
+        for task in meta.get('tasks', []) or []:
+            task_text = str(task or '').strip()
+            if task_text:
+                return task_text
+        return None
+
+    def _encode_raw_text_embedding(self, text: str) -> torch.Tensor | None:
+        tokenizer = self._get_text_tokenizer()
+        if tokenizer is None:
+            return None
+
+        cached = self._text_embedding_cache.get(text)
+        if cached is not None:
+            return cached
+
+        tokenized = tokenizer.tokenize(text)
+        with torch.inference_mode():
+            text_embedding = tokenizer(**tokenized)
+        if text_embedding.ndim != 4:
+            raise ValueError(
+                f'Expected tokenizer output with 4 dims, got {text_embedding.ndim} for text `{text}`.'
+            )
+        text_embedding = text_embedding.squeeze(0).squeeze(0).cpu().float().contiguous()
+        self._text_embedding_cache[text] = text_embedding
+        return text_embedding
+
+    def _expand_text_embedding_like(
+        self, source_embedding, target_embedding: torch.Tensor
+    ) -> torch.Tensor | None:
+        if source_embedding is None:
+            return None
+
+        source_embedding = torch.as_tensor(source_embedding)
+        target_embedding = torch.as_tensor(target_embedding)
+        if tuple(source_embedding.shape) == tuple(target_embedding.shape):
+            return source_embedding.to(dtype=target_embedding.dtype)
+
+        if (
+            source_embedding.ndim + 1 == target_embedding.ndim
+            and tuple(source_embedding.shape) == tuple(target_embedding.shape[1:])
+        ):
+            return source_embedding.unsqueeze(0).expand(*target_embedding.shape).contiguous().to(
+                dtype=target_embedding.dtype
+            )
+
+        if (
+            source_embedding.ndim == target_embedding.ndim
+            and source_embedding.shape[0] == 1
+            and tuple(source_embedding.shape[1:]) == tuple(target_embedding.shape[1:])
+        ):
+            return source_embedding.expand(*target_embedding.shape).contiguous().to(
+                dtype=target_embedding.dtype
+            )
+
+        return None
+
+    def _get_empty_text_embedding(self, template_text_embedding: torch.Tensor) -> torch.Tensor | None:
+        if self._empty_text_embedding is None:
+            self._empty_text_embedding = self._encode_raw_text_embedding('')
+        return self._expand_text_embedding_like(
+            self._empty_text_embedding,
+            template_text_embedding,
+        )
+
+    def _get_selected_text_embedding(self, meta: dict, data_dict: dict) -> torch.Tensor:
+        raw_text = self._resolve_raw_text(meta)
+        if self.prefer_raw_text_for_text_embeddings and raw_text:
+            try:
+                raw_text_embedding = self._encode_raw_text_embedding(raw_text)
+            except Exception as exc:
+                if not self._raw_text_warning_emitted:
+                    logger.warning(
+                        'Failed to encode raw text `%s` for repo %s; falling back to precomputed text_emb. Error: %s',
+                        raw_text,
+                        self.repo_id,
+                        exc,
+                    )
+                    self._raw_text_warning_emitted = True
+            else:
+                if raw_text_embedding is not None:
+                    return self._get_cfg_text_embedding(raw_text_embedding)
+
+        fallback_text_embedding = data_dict.get(f"{self.used_video_keys[0]}.text_emb")
+        if fallback_text_embedding is None:
+            if raw_text:
+                raw_text_embedding = self._encode_raw_text_embedding(raw_text)
+                if raw_text_embedding is not None:
+                    return self._get_cfg_text_embedding(raw_text_embedding)
+            raise ValueError(
+                f'No text embedding source found for repo {self.repo_id}, episode {meta.get("episode_index")}.',
+            )
+
+        return self._get_cfg_text_embedding(fallback_text_embedding)
+
     def _cat_video_latents(self,
-                           data_dict
+                           data_dict,
+                           text_embedding=None
                            ):
         latent_lst = []
         for key in self.used_video_keys:
@@ -452,9 +587,9 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
         wrist_latent = torch.cat(latent_lst[1:], dim=2)
         cat_latent = torch.cat([wrist_latent, latent_lst[0]], dim=1)
 
-        text_emb = self._get_cfg_text_embedding(
-            data_dict[f"{self.used_video_keys[0]}.text_emb"]
-        )
+        if text_embedding is None:
+            text_embedding = data_dict.get(f"{self.used_video_keys[0]}.text_emb")
+        text_emb = self._get_cfg_text_embedding(text_embedding)
 
         out_dict = dict(
             latents = cat_latent,
@@ -487,7 +622,8 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
         return actions, actions_mask
     
     def _cat_video_images(self,
-                          data_dict):
+                          data_dict,
+                          text_embedding=None):
         image_lst = []
         for key in self.used_video_keys:
             image = data_dict[f"{key}.video"]
@@ -525,9 +661,9 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
             image_lst.append(image)
 
         cat_image = self._merge_multi_view_images(image_lst)
-        text_emb = self._get_cfg_text_embedding(
-            data_dict[f"{self.used_video_keys[0]}.text_emb"]
-        )
+        if text_embedding is None:
+            text_embedding = data_dict.get(f"{self.used_video_keys[0]}.text_emb")
+        text_emb = self._get_cfg_text_embedding(text_embedding)
 
         out_dict = dict(
             frames=cat_image,
@@ -539,34 +675,21 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
         if torch.rand(1).item() >= self.cfg_prob:
             return text_emb
 
+        matched_empty_embedding = self._expand_text_embedding_like(self.empty_emb, text_emb)
+        if matched_empty_embedding is not None:
+            return matched_empty_embedding
+
+        matched_empty_text_embedding = self._get_empty_text_embedding(text_emb)
+        if matched_empty_text_embedding is not None:
+            return matched_empty_text_embedding
+
         if self.empty_emb is None:
             return torch.zeros_like(text_emb)
 
-        empty_emb = torch.as_tensor(self.empty_emb)
-        if empty_emb.shape == text_emb.shape:
-            return empty_emb.to(dtype=text_emb.dtype)
-
-        if (
-            empty_emb.ndim + 1 == text_emb.ndim
-            and tuple(empty_emb.shape) == tuple(text_emb.shape[1:])
-        ):
-            return empty_emb.unsqueeze(0).expand(*text_emb.shape).contiguous().to(
-                dtype=text_emb.dtype
-            )
-
-        if (
-            empty_emb.ndim == text_emb.ndim
-            and empty_emb.shape[0] == 1
-            and tuple(empty_emb.shape[1:]) == tuple(text_emb.shape[1:])
-        ):
-            return empty_emb.expand(*text_emb.shape).contiguous().to(
-                dtype=text_emb.dtype
-            )
-
         if not self._empty_emb_shape_warning_emitted:
             logger.warning(
-                'empty_emb shape %s does not match text_emb shape %s for repo %s; falling back to zeros_like(text_emb).',
-                tuple(empty_emb.shape),
+                'empty_emb shape %s does not match text_emb shape %s for repo %s; falling back to tokenizer empty-text embedding or zeros_like(text_emb).',
+                tuple(torch.as_tensor(self.empty_emb).shape),
                 tuple(text_emb.shape),
                 self.repo_id,
             )
@@ -836,7 +959,11 @@ class LatentLeRobotDataset(torch.utils.data.Dataset):
 
         hf_data_frames = self._get_range_hf_data(start_frame, end_frame, episode_index)
         ori_data_dict.update(hf_data_frames)
-        out_dict = self._cat_video_images(ori_data_dict)
+        selected_text_embedding = self._get_selected_text_embedding(cur_meta, ori_data_dict)
+        out_dict = self._cat_video_images(
+            ori_data_dict,
+            text_embedding=selected_text_embedding,
+        )
 
         actions, actions_mask = self._action_post_process(
             local_start_frame,

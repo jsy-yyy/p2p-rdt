@@ -1,19 +1,21 @@
 from pathlib import Path
 
+import torch
+from sentence_transformers import SentenceTransformer
+from transformers import T5TokenizerFast, UMT5EncoderModel
+
 from elefant.text_tokenizer.base_text_tokenizer import TextBaseTokenizer
 from elefant.text_tokenizer.config import (
     GemmaTextTokenizerConfig,
     DummyTextTokenizerConfig,
     LingbotTextTokenizerConfig,
 )
-import torch
-from sentence_transformers import SentenceTransformer
-from transformers import T5TokenizerFast, UMT5EncoderModel
 
 try:
     from diffusers.pipelines.wan.pipeline_wan import prompt_clean
 except Exception:
     prompt_clean = None
+
 
 
 def _mean_pool_last_hidden_state(
@@ -43,9 +45,19 @@ class DummyTextTokenizer(TextBaseTokenizer):
     def forward(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
-        batch_size, text_dim = input_ids.shape
-        return torch.ones(batch_size, 1, self.n_text_tokens, self.embed_dim).to(
-            input_ids.device
+        if input_ids.ndim == 3:
+            batch_size, n_steps, _ = input_ids.shape
+        elif input_ids.ndim == 2:
+            batch_size, _ = input_ids.shape
+            n_steps = 1
+        else:
+            raise ValueError(f"Invalid input_ids shape: {input_ids.shape}")
+        return torch.ones(
+            batch_size,
+            n_steps,
+            self.n_text_tokens,
+            self.embed_dim,
+            device=input_ids.device,
         )
 
     def get_n_text_tokens(self) -> int:
@@ -58,7 +70,7 @@ class DummyTextTokenizer(TextBaseTokenizer):
 class GemmaTextTokenizer(TextBaseTokenizer):
     def __init__(self, config: GemmaTextTokenizerConfig):
         super().__init__(config)
-        self.gemma_model = SentenceTransformer(config.model_id).eval()
+        self.gemma_model = SentenceTransformer(config.model_id, device="cpu").eval()
         self.tokenizer = self.gemma_model.tokenizer
         self.gemma_embedding = self.gemma_model[0].auto_model.eval()
         self.embed_dim = self.gemma_model.get_sentence_embedding_dimension()
@@ -81,26 +93,29 @@ class GemmaTextTokenizer(TextBaseTokenizer):
     def forward(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> torch.Tensor:
-        if len(input_ids.shape) == 3:
+        if input_ids.ndim == 3:
             batch_size, n_steps, text_dim = input_ids.shape
-        elif len(input_ids.shape) == 2:
+        elif input_ids.ndim == 2:
             batch_size, text_dim = input_ids.shape
             n_steps = 1
         else:
             raise ValueError(f"Invalid input_ids shape: {input_ids.shape}")
-        input_ids = input_ids.reshape(-1, text_dim).to(self.gemma_embedding.device)
-        attention_mask = attention_mask.reshape(-1, text_dim).to(
-            self.gemma_embedding.device
-        )
+
+        encoder_device = next(self.gemma_embedding.parameters()).device
+        input_ids = input_ids.reshape(-1, text_dim).to(encoder_device)
+        attention_mask = attention_mask.reshape(-1, text_dim).to(encoder_device)
         text_features = self.gemma_embedding(
             input_ids, attention_mask
         ).last_hidden_state
         sentence_embedding = _mean_pool_last_hidden_state(text_features, attention_mask)
+        sentence_embedding = sentence_embedding.to(dtype=torch.float32)
 
-        sentence_embedding = sentence_embedding.reshape(
-            batch_size, n_steps, self.n_text_tokens, self.embed_dim
+        return sentence_embedding.reshape(
+            batch_size,
+            n_steps,
+            self.n_text_tokens,
+            self.embed_dim,
         )
-        return sentence_embedding
 
     def get_n_text_tokens(self) -> int:
         return self.n_text_tokens

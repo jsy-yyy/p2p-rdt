@@ -19,6 +19,8 @@ class DummyTextTokenizerConfig(ConfigBase):
 
 class TextTokenizerConfig(ConfigBase):
     text_tokenizer_name: Optional[str] = None
+    model_name_or_path: Optional[str] = None
+    max_position_embeddings: Optional[int] = None
     text_annotation_model_version: List[str] = [
         "gemini-2.5-flash",
         "gemini-2.5-flash-thinking-0905",

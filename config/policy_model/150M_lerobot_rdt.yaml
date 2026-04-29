@@ -1,13 +1,15 @@
 shared:
-  output_path: /data/jsy/open-p2p/train_out/150M_lerobot_rdt_adjust_bottle_multiview_cond_new_wo_stat_init_from_pretrain_nofreeze
+  output_path: /data/jsy/open-p2p/train_out/wo_state_cond_random_init
   enable_torch_compile: true
   n_seq_timesteps: 128
   frame_height: &frame_height 192
   frame_width: &frame_width 192
   precision: bf16-mixed
   text_tokenizer_config:
-    text_tokenizer_name: "lingbot"
-    text_embedding_shape: [1, 4096]
+    text_tokenizer_name: "gemma"
+    model_name_or_path: "checkpoints/embeddinggemma-300M"
+    max_position_embeddings: 128
+    text_embedding_shape: [1, 768]
     text_annotation_model_version: ["gemini-2.5-flash", "gemini-2.5-flash-thinking-0905"]
   tokenizer:
     type: "conv"
